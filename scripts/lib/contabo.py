@@ -158,22 +158,25 @@ class ContaboClient:
         raise TimeoutError(f"SSH on {ip}:{port} not reachable within {timeout}s")
 
     def set_ptr(self, instance_id: int, hostname: str) -> None:
-        """Set reverse DNS on the instance's primary IPv4."""
+        """Set reverse DNS for the instance's primary IPv4 via the DNS PTR API.
+
+        Contabo's rDNS endpoint lives under /v1/dns/ptr/{ip}, not on the
+        compute instance resource.
+        """
         inst = self.get_instance(instance_id)
         v4 = (inst.get("ipConfig") or {}).get("v4") or {}
         ip = v4.get("ip")
         if not ip:
             raise RuntimeError(f"Instance {instance_id} has no IPv4 address yet")
-        self._request(
-            "PATCH",
-            f"/compute/instances/{instance_id}",
-            json={"displayName": inst.get("displayName")},
-        )
-        self._request(
-            "PUT",
-            f"/compute/instances/{instance_id}/v1/reverse-dns",
-            json={"ipv4": {"ip": ip, "ptr": hostname}},
-        )
+        try:
+            self._request("PUT", f"/dns/ptr/{ip}", json={"domain": hostname})
+        except requests.HTTPError as exc:
+            # Some accounts require POST to create first, then PUT to update
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in (404, 405):
+                self._request("POST", f"/dns/ptr/{ip}", json={"domain": hostname})
+            else:
+                raise
 
     def destroy_instance(self, instance_id: int) -> None:
         self._request("DELETE", f"/compute/instances/{instance_id}")
