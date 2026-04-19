@@ -119,6 +119,7 @@ class MailserverClient:
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")
         self._wait_for_container("mailserver")
+        self.wait_for_mailserver_ready("mailserver")
 
     def _wait_for_container(self, name: str, timeout: int = 300) -> None:
         start = time.time()
@@ -141,6 +142,34 @@ class MailserverClient:
         raise TimeoutError(
             f"Container {name} did not reach running state within {timeout}s "
             f"(last seen: {last_status}). Last 80 log lines:\n{logs}"
+        )
+
+    def wait_for_mailserver_ready(self, name: str = "mailserver", timeout: int = 600) -> None:
+        """Wait until the mailserver container's healthcheck reports 'healthy'.
+
+        docker-mailserver's healthcheck verifies Postfix is listening on SMTP,
+        which is the earliest point `setup email add` and friends are safe to run.
+        Container running != mailserver ready; skipping this wait causes SIGKILL
+        on docker exec as the internal config is still generating.
+        """
+        start = time.time()
+        last = ""
+        while time.time() - start < timeout:
+            _, out, _ = self.sudo(
+                f"docker inspect -f '{{{{.State.Status}}}} {{{{.State.Health.Status}}}}' {name}",
+                check=False,
+            )
+            last = out.strip()
+            if "exited" in last or "dead" in last:
+                _, logs, _ = self.sudo(f"docker logs --tail 80 {name}", check=False)
+                raise RuntimeError(f"Container {name}: {last}. Last 80 log lines:\n{logs}")
+            if last.endswith(" healthy"):
+                return
+            time.sleep(10)
+        _, logs, _ = self.sudo(f"docker logs --tail 80 {name}", check=False)
+        raise TimeoutError(
+            f"Container {name} did not become healthy within {timeout}s (last: {last}). "
+            f"Last 80 log lines:\n{logs}"
         )
 
     def add_mailbox(self, email: str, password: str) -> None:

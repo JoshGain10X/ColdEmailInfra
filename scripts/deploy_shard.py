@@ -252,6 +252,9 @@ def _step_create_mailboxes(state: ShardState) -> None:
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
+        # Safety net for resumed runs: step 5 may have marked done while
+        # the container was still initialising. Wait for healthy before exec.
+        ms.wait_for_mailserver_ready()
         for mb in state.get("mailboxes"):
             ms.add_mailbox(mb["email"], mb["password"])
     finally:
@@ -272,6 +275,7 @@ def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
+        ms.wait_for_mailserver_ready()
         for sub in state.get("subdomains"):
             fqdn = f"{sub}.{domain}"
             public_key = ms.setup_dkim(fqdn, keysize=2048)
