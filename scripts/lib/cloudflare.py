@@ -146,11 +146,28 @@ class CloudflareClient:
         return results
 
     def upsert_record(self, zone_id: str, type: str, name: str, content: str, **extra) -> dict:
-        """Create or update a DNS record. Matches existing records by (type, name)."""
-        existing = self.list_records(zone_id, name=name, type=type)
+        """Create or update a DNS record. Matches existing records by (type, name).
+
+        If creating an A/AAAA/MX/TXT record where a CNAME already exists at the same
+        name (Cloudflare rejects this combo), delete the conflicting CNAME first.
+        If creating a CNAME where any other record type exists at the same name,
+        delete the others first.
+        """
+        all_at_name = self.list_records(zone_id, name=name)
+        same_type = [r for r in all_at_name if r["type"] == type]
+        conflicts: list[dict] = []
+        if type == "CNAME":
+            conflicts = [r for r in all_at_name if r["type"] != "CNAME"]
+        else:
+            conflicts = [r for r in all_at_name if r["type"] == "CNAME"]
+
+        for r in conflicts:
+            print(f"  [cloudflare] Deleting conflicting {r['type']} record {r['name']} -> {r.get('content')}")
+            self._request("DELETE", f"/zones/{zone_id}/dns_records/{r['id']}")
+
         payload = {"type": type, "name": name, "content": content, "ttl": 1, **extra}
-        if existing:
-            record = existing[0]
+        if same_type:
+            record = same_type[0]
             body = self._request("PUT", f"/zones/{zone_id}/dns_records/{record['id']}", json=payload)
             return body["result"]
         body = self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
