@@ -231,7 +231,8 @@ def _step_install_mailserver(state: ShardState, domain: str) -> None:
     vps = state.get("vps")
     le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-    ms = MailserverClient(vps["ip"], ssh_key)
+    ssh_user = os.environ.get("SSH_USER", "admin")
+    ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
         ms.install_docker()
@@ -247,7 +248,8 @@ def _step_create_mailboxes(state: ShardState) -> None:
     click.echo("[6/10] Creating 100 mailboxes")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-    ms = MailserverClient(vps["ip"], ssh_key)
+    ssh_user = os.environ.get("SSH_USER", "admin")
+    ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
         for mb in state.get("mailboxes"):
@@ -263,10 +265,11 @@ def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
     click.echo("[7/10] Generating DKIM keys and publishing to Cloudflare")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
+    ssh_user = os.environ.get("SSH_USER", "admin")
     cf = CloudflareClient()
     dkim: dict[str, str] = state.get("dkim") or {}
 
-    ms = MailserverClient(vps["ip"], ssh_key)
+    ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
         for sub in state.get("subdomains"):
@@ -279,7 +282,7 @@ def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
             )
             state.set("dkim", dkim)
         # OpenDKIM needs a restart to pick up newly-generated keys
-        ms.run("cd /opt/mailserver && docker compose restart mailserver")
+        ms.restart_mailserver()
     finally:
         ms.close()
     state.mark_step_done("setup_dkim")
