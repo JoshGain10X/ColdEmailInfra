@@ -131,7 +131,9 @@ class ContaboClient:
         while time.time() < deadline:
             inst = self.get_instance(instance_id)
             status = inst.get("status")
-            ip = (inst.get("ipConfig", {}).get("v4", {}) or {}).get("ip")
+            ip_config = inst.get("ipConfig") or {}
+            v4 = ip_config.get("v4") or {}
+            ip = v4.get("ip")
             if status == "running" and ip:
                 return inst
             time.sleep(15)
@@ -150,7 +152,7 @@ class ContaboClient:
     def set_ptr(self, instance_id: int, hostname: str) -> None:
         """Set reverse DNS on the instance's primary IPv4."""
         inst = self.get_instance(instance_id)
-        v4 = inst.get("ipConfig", {}).get("v4", {})
+        v4 = (inst.get("ipConfig") or {}).get("v4") or {}
         ip = v4.get("ip")
         if not ip:
             raise RuntimeError(f"Instance {instance_id} has no IPv4 address yet")

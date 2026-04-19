@@ -125,7 +125,7 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
         raise
     instance_id = inst.get("instanceId") or inst.get("id")
     inst = cb.wait_for_instance_ready(instance_id)
-    ip = (inst.get("ipConfig", {}).get("v4", {}) or {}).get("ip")
+    ip = ((inst.get("ipConfig") or {}).get("v4") or {}).get("ip")
     state.set("vps", {
         "id": instance_id,
         "ip": ip,
