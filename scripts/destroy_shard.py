@@ -19,9 +19,8 @@ from lib.state import ShardState, SHARDS_DIR
 
 @click.command()
 @click.option("--domain", required=True)
-@click.option("--cloudflare-zone-id", required=True, envvar="CLOUDFLARE_ZONE_ID")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt")
-def main(domain: str, cloudflare_zone_id: str, yes: bool) -> None:
+def main(domain: str, yes: bool) -> None:
     load_dotenv()
     state = ShardState(domain)
     if not state.path.exists():
@@ -38,9 +37,14 @@ def main(domain: str, cloudflare_zone_id: str, yes: bool) -> None:
         except Exception as exc:
             click.echo(f"  VPS destroy warning: {exc}")
 
-    click.echo(f"Removing DNS records for {domain}")
-    removed = CloudflareClient().delete_records_matching(cloudflare_zone_id, domain)
-    click.echo(f"  Removed {removed} records")
+    cf = CloudflareClient()
+    zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)
+    if zone_id:
+        click.echo(f"Removing DNS records for {domain} (zone {zone_id})")
+        removed = cf.delete_records_matching(zone_id, domain)
+        click.echo(f"  Removed {removed} records")
+    else:
+        click.echo(f"  No Cloudflare zone found for {domain}; skipping DNS cleanup")
 
     archive_dir = SHARDS_DIR / "archived"
     archive_dir.mkdir(exist_ok=True)

@@ -28,7 +28,7 @@ from lib.state import ShardState, SHARDS_DIR
 
 def _load_env() -> None:
     load_dotenv()
-    for required in ("CLOUDFLARE_API_TOKEN", "MAILCHEAP_API_KEY"):
+    for required in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "MAILCHEAP_API_KEY"):
         if not os.environ.get(required):
             raise click.ClickException(f"Missing env var: {required}")
 
@@ -37,10 +37,48 @@ def _mail_hostname(domain: str) -> str:
     return f"mail.{domain}"
 
 
+def _step_ensure_domain(state: ShardState, domain: str, skip_purchase: bool, assume_yes: bool) -> str:
+    """Ensure the domain is registered and owned on Cloudflare. Returns the zone ID."""
+    cf = CloudflareClient()
+    zone_id = cf.get_zone_id(domain)
+    if zone_id:
+        click.echo(f"[0/10] Domain {domain} already on Cloudflare (zone {zone_id})")
+        state.set("cloudflare_zone_id", zone_id)
+        state.mark_step_done("ensure_domain")
+        return zone_id
+
+    if skip_purchase:
+        raise click.ClickException(
+            f"Domain {domain} is not on Cloudflare and --skip-purchase was set. "
+            "Add the domain to Cloudflare manually, then re-run."
+        )
+
+    click.echo(f"[0/10] Domain {domain} not yet on Cloudflare. Checking availability...")
+    avail = cf.registrar_check_availability(domain)
+    if not avail.get("available"):
+        raise click.ClickException(
+            f"Domain {domain} is not available for registration via Cloudflare Registrar. "
+            "If you already own it elsewhere, transfer it to Cloudflare first."
+        )
+
+    price = avail.get("price") or avail.get("renewal_price") or avail.get("created_price") or "?"
+    click.echo(f"       Available. Cost: {price} for 1 year (at-cost via Cloudflare Registrar).")
+    if not assume_yes:
+        click.confirm("       Register this domain now?", abort=True)
+
+    click.echo("       Registering...")
+    cf.registrar_register(domain, years=1, privacy=True)
+    zone_id = cf.wait_for_zone(domain)
+    click.echo(f"       Registered. Zone ID: {zone_id}")
+    state.set("cloudflare_zone_id", zone_id)
+    state.mark_step_done("ensure_domain")
+    return zone_id
+
+
 def _step_generate(state: ShardState, domain: str) -> None:
     if state.is_step_done("generate"):
         return
-    click.echo("[1/9] Generating subdomains and mailboxes")
+    click.echo("[1/10] Generating subdomains and mailboxes")
     subs = pick_subdomains(domain)
     seed = secrets.randbits(64)
     mailboxes = generate_mailboxes(domain, subs, seed=seed)
@@ -53,7 +91,7 @@ def _step_generate(state: ShardState, domain: str) -> None:
 def _step_provision_vps(state: ShardState, domain: str, plan: str, region: str) -> None:
     if state.is_step_done("provision_vps"):
         return
-    click.echo("[2/9] Provisioning Mailcheap VPS")
+    click.echo("[2/10] Provisioning Mailcheap VPS")
     mc = MailcheapClient()
     ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
     public_key = ssh_pub_path.read_text().strip()
@@ -73,7 +111,7 @@ def _step_provision_vps(state: ShardState, domain: str, plan: str, region: str) 
 def _step_set_ptr(state: ShardState, domain: str) -> None:
     if state.is_step_done("set_ptr"):
         return
-    click.echo("[3/9] Setting PTR (reverse DNS)")
+    click.echo("[3/10] Setting PTR (reverse DNS)")
     mc = MailcheapClient()
     vps = state.get("vps")
     hostname = _mail_hostname(domain)
@@ -97,7 +135,7 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
 def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
     if state.is_step_done("configure_dns"):
         return
-    click.echo("[4/9] Configuring Cloudflare DNS (pre-DKIM records)")
+    click.echo("[4/10] Configuring Cloudflare DNS (pre-DKIM records)")
     cf = CloudflareClient()
     vps_ip = state.get("vps")["ip"]
     subs = state.get("subdomains")
@@ -131,7 +169,7 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
 def _step_install_mailserver(state: ShardState, domain: str) -> None:
     if state.is_step_done("install_mailserver"):
         return
-    click.echo("[5/9] Installing docker-mailserver on VPS")
+    click.echo("[5/10] Installing docker-mailserver on VPS")
     vps = state.get("vps")
     le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
@@ -148,7 +186,7 @@ def _step_install_mailserver(state: ShardState, domain: str) -> None:
 def _step_create_mailboxes(state: ShardState) -> None:
     if state.is_step_done("create_mailboxes"):
         return
-    click.echo("[6/9] Creating 100 mailboxes")
+    click.echo("[6/10] Creating 100 mailboxes")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
     ms = MailserverClient(vps["ip"], ssh_key)
@@ -164,7 +202,7 @@ def _step_create_mailboxes(state: ShardState) -> None:
 def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
     if state.is_step_done("setup_dkim"):
         return
-    click.echo("[7/9] Generating DKIM keys and publishing to Cloudflare")
+    click.echo("[7/10] Generating DKIM keys and publishing to Cloudflare")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
     cf = CloudflareClient()
@@ -192,7 +230,7 @@ def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
 def _step_export_bison(state: ShardState, domain: str) -> None:
     if state.is_step_done("export_bison"):
         return
-    click.echo("[8/9] Exporting Email Bison CSV")
+    click.echo("[8/10] Exporting Email Bison CSV")
     out_path = SHARDS_DIR / f"{domain}_bison.csv"
     bison_export(state.get("mailboxes"), _mail_hostname(domain), out_path)
     state.set("bison_csv", str(out_path))
@@ -200,7 +238,7 @@ def _step_export_bison(state: ShardState, domain: str) -> None:
 
 
 def _step_final_summary(state: ShardState, domain: str) -> None:
-    click.echo("[9/9] Deploy complete")
+    click.echo("[10/10] Deploy complete")
     click.echo(f"  VPS IP          : {state.get('vps')['ip']}")
     click.echo(f"  Mail hostname   : {_mail_hostname(domain)}")
     click.echo(f"  Subdomains      : {len(state.get('subdomains'))}")
@@ -212,20 +250,22 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
 
 
 @click.command()
-@click.option("--domain", required=True, help="Root pre-warmed domain, e.g. example.co.uk")
-@click.option("--cloudflare-zone-id", required=True, envvar="CLOUDFLARE_ZONE_ID")
-@click.option("--mailcheap-plan", default="vps-starter")
-@click.option("--region", default="uk-lon")
-def main(domain: str, cloudflare_zone_id: str, mailcheap_plan: str, region: str) -> None:
+@click.option("--domain", required=True, help="Root domain, e.g. example.co.uk (purchased via CF Registrar if not already yours)")
+@click.option("--mailcheap-plan", default=lambda: os.environ.get("MAILCHEAP_PLAN", "vps-starter"))
+@click.option("--region", default=lambda: os.environ.get("MAILCHEAP_REGION", "uk-lon"))
+@click.option("--skip-purchase", is_flag=True, help="Error out if domain isn't already on Cloudflare (don't buy via Registrar)")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip interactive confirmations (e.g. domain purchase)")
+def main(domain: str, mailcheap_plan: str, region: str, skip_purchase: bool, assume_yes: bool) -> None:
     _load_env()
     state = ShardState(domain)
+    zone_id = _step_ensure_domain(state, domain, skip_purchase, assume_yes)
     _step_generate(state, domain)
     _step_provision_vps(state, domain, mailcheap_plan, region)
     _step_set_ptr(state, domain)
-    _step_configure_dns(state, domain, cloudflare_zone_id)
+    _step_configure_dns(state, domain, zone_id)
     _step_install_mailserver(state, domain)
     _step_create_mailboxes(state)
-    _step_setup_dkim(state, domain, cloudflare_zone_id)
+    _step_setup_dkim(state, domain, zone_id)
     _step_export_bison(state, domain)
     _step_final_summary(state, domain)
 
