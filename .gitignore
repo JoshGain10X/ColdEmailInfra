@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+shards/*.json
+shards/*_bison.csv
+*.log
+.DS_Store
