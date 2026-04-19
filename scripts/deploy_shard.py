@@ -27,7 +27,7 @@ from lib.state import ShardState, SHARDS_DIR
 
 
 def _load_env() -> None:
-    load_dotenv()
+    load_dotenv(override=True)
     required = (
         "CLOUDFLARE_API_TOKEN",
         "CLOUDFLARE_ACCOUNT_ID",

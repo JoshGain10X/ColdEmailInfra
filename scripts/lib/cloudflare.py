@@ -12,15 +12,35 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 
 class CloudflareClient:
     def __init__(self, token: str | None = None, account_id: str | None = None):
-        self.token = (token or os.environ["CLOUDFLARE_API_TOKEN"]).strip()
+        raw_token = token or os.environ["CLOUDFLARE_API_TOKEN"]
+        self.token = raw_token.strip()
         self.account_id = (account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip() or None
-        if not self.token:
-            raise RuntimeError("CLOUDFLARE_API_TOKEN is empty")
+        self._validate_token(raw_token, self.token)
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         })
+
+    @staticmethod
+    def _validate_token(raw: str, cleaned: str) -> None:
+        if not cleaned:
+            raise RuntimeError("CLOUDFLARE_API_TOKEN is empty. Check .env is in the current directory and has the token set.")
+        if cleaned.startswith("<") or cleaned.endswith(">"):
+            raise RuntimeError(f"CLOUDFLARE_API_TOKEN looks like a placeholder ({cleaned[:12]}...). Replace with the actual token from dash.cloudflare.com/profile/api-tokens.")
+        if any(c in cleaned for c in " \t\n\r"):
+            raise RuntimeError(
+                f"CLOUDFLARE_API_TOKEN contains whitespace inside the value (len={len(cleaned)}). "
+                "Open .env, delete the value, re-paste from Cloudflare without wrapping quotes."
+            )
+        if not all(c.isascii() and (c.isalnum() or c in "-_") for c in cleaned):
+            bad = [repr(c) for c in cleaned if not (c.isascii() and (c.isalnum() or c in "-_"))]
+            raise RuntimeError(
+                f"CLOUDFLARE_API_TOKEN contains unexpected characters: {', '.join(bad[:5])}. "
+                "Tokens are alphanumeric + dashes/underscores only. Re-copy from the Cloudflare dashboard."
+            )
+        if len(cleaned) < 20:
+            raise RuntimeError(f"CLOUDFLARE_API_TOKEN is suspiciously short (len={len(cleaned)}). CF tokens are ~40 chars.")
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         resp = self.session.request(method, f"{API_BASE}{path}", timeout=30, **kwargs)
