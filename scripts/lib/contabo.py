@@ -160,23 +160,17 @@ class ContaboClient:
     def set_ptr(self, instance_id: int, hostname: str) -> None:
         """Set reverse DNS for the instance's primary IPv4 via the DNS PTR API.
 
-        Contabo's rDNS endpoint lives under /v1/dns/ptr/{ip}, not on the
-        compute instance resource.
+        Endpoint (verified against Contabo's cntb CLI source):
+          PUT /v1/dns/ptrs/{ipAddress}   body: {"ptr": "<hostname>"}
+        For IPv4 the default PTR is created at instance provisioning, so we
+        only need to UPDATE (PUT). POST /v1/dns/ptrs is IPv6-only per the API.
         """
         inst = self.get_instance(instance_id)
         v4 = (inst.get("ipConfig") or {}).get("v4") or {}
         ip = v4.get("ip")
         if not ip:
             raise RuntimeError(f"Instance {instance_id} has no IPv4 address yet")
-        try:
-            self._request("PUT", f"/dns/ptr/{ip}", json={"domain": hostname})
-        except requests.HTTPError as exc:
-            # Some accounts require POST to create first, then PUT to update
-            status = exc.response.status_code if exc.response is not None else 0
-            if status in (404, 405):
-                self._request("POST", f"/dns/ptr/{ip}", json={"domain": hostname})
-            else:
-                raise
+        self._request("PUT", f"/dns/ptrs/{ip}", json={"ptr": hostname})
 
     def destroy_instance(self, instance_id: int) -> None:
         self._request("DELETE", f"/compute/instances/{instance_id}")
