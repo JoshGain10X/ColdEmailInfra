@@ -20,17 +20,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.bison import export as bison_export
 from lib.cloudflare import CloudflareClient
+from lib.contabo import ContaboClient
 from lib.generate import generate_mailboxes, pick_subdomains
-from lib.mailcheap import MailcheapClient
 from lib.mailserver import MailserverClient
 from lib.state import ShardState, SHARDS_DIR
 
 
 def _load_env() -> None:
     load_dotenv()
-    for required in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "MAILCHEAP_API_KEY"):
-        if not os.environ.get(required):
-            raise click.ClickException(f"Missing env var: {required}")
+    required = (
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CONTABO_CLIENT_ID",
+        "CONTABO_CLIENT_SECRET",
+        "CONTABO_API_USER",
+        "CONTABO_API_PASSWORD",
+    )
+    for key in required:
+        if not os.environ.get(key):
+            raise click.ClickException(f"Missing env var: {key}")
 
 
 def _mail_hostname(domain: str) -> str:
@@ -88,23 +96,31 @@ def _step_generate(state: ShardState, domain: str) -> None:
     state.mark_step_done("generate")
 
 
-def _step_provision_vps(state: ShardState, domain: str, plan: str, region: str) -> None:
+def _step_provision_vps(state: ShardState, domain: str, product_id: str, region: str, image_id: str) -> None:
     if state.is_step_done("provision_vps"):
         return
-    click.echo("[2/10] Provisioning Mailcheap VPS")
-    mc = MailcheapClient()
+    click.echo("[2/10] Provisioning Contabo VPS")
+    cb = ContaboClient()
     ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
     public_key = ssh_pub_path.read_text().strip()
-    ssh_key_id = mc.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
-    vps = mc.create_vps(
-        hostname=_mail_hostname(domain),
-        plan=plan,
+    ssh_key_id = cb.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
+    inst = cb.create_instance(
+        display_name=_mail_hostname(domain),
+        product_id=product_id,
         region=region,
         ssh_key_id=ssh_key_id,
+        image_id=image_id,
     )
-    vps = mc.wait_for_vps_ready(vps["id"])
-    state.set("vps", {"id": vps["id"], "ip": vps["ipv4_address"], "plan": plan, "region": region})
-    mc.wait_for_ssh(vps["ipv4_address"])
+    instance_id = inst.get("instanceId") or inst.get("id")
+    inst = cb.wait_for_instance_ready(instance_id)
+    ip = (inst.get("ipConfig", {}).get("v4", {}) or {}).get("ip")
+    state.set("vps", {
+        "id": instance_id,
+        "ip": ip,
+        "product_id": product_id,
+        "region": region,
+    })
+    cb.wait_for_ssh(ip)
     state.mark_step_done("provision_vps")
 
 
@@ -112,10 +128,10 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
     if state.is_step_done("set_ptr"):
         return
     click.echo("[3/10] Setting PTR (reverse DNS)")
-    mc = MailcheapClient()
+    cb = ContaboClient()
     vps = state.get("vps")
     hostname = _mail_hostname(domain)
-    mc.set_ptr(vps["id"], hostname)
+    cb.set_ptr(vps["id"], hostname)
 
     deadline = time.time() + 600
     while time.time() < deadline:
@@ -251,16 +267,20 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
 
 @click.command()
 @click.option("--domain", required=True, help="Root domain, e.g. example.co.uk (purchased via CF Registrar if not already yours)")
-@click.option("--mailcheap-plan", default=lambda: os.environ.get("MAILCHEAP_PLAN", "vps-starter"))
-@click.option("--region", default=lambda: os.environ.get("MAILCHEAP_REGION", "uk-lon"))
+@click.option("--contabo-product-id", default=lambda: os.environ.get("CONTABO_PRODUCT_ID", "V45"),
+              help="Contabo product ID. V45 = Cloud VPS 10 (4GB RAM, 2 vCPU, 50GB NVMe).")
+@click.option("--region", default=lambda: os.environ.get("CONTABO_REGION", "EU"),
+              help="Contabo region. EU (Germany), US-central, US-east, US-west, SIN, UK.")
+@click.option("--image-id", default=lambda: os.environ.get("CONTABO_IMAGE_ID", "d64d5c6c-9dda-4e38-8174-0ee282474d8a"),
+              help="Contabo image ID. Default is Ubuntu 22.04 LTS.")
 @click.option("--skip-purchase", is_flag=True, help="Error out if domain isn't already on Cloudflare (don't buy via Registrar)")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip interactive confirmations (e.g. domain purchase)")
-def main(domain: str, mailcheap_plan: str, region: str, skip_purchase: bool, assume_yes: bool) -> None:
+def main(domain: str, contabo_product_id: str, region: str, image_id: str, skip_purchase: bool, assume_yes: bool) -> None:
     _load_env()
     state = ShardState(domain)
     zone_id = _step_ensure_domain(state, domain, skip_purchase, assume_yes)
     _step_generate(state, domain)
-    _step_provision_vps(state, domain, mailcheap_plan, region)
+    _step_provision_vps(state, domain, contabo_product_id, region, image_id)
     _step_set_ptr(state, domain)
     _step_configure_dns(state, domain, zone_id)
     _step_install_mailserver(state, domain)

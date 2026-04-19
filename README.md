@@ -12,7 +12,7 @@ Hands-off after first-time setup: the deploy command takes a single `--domain` a
         └── 5 mailboxes each (first.last@sub.domain, British female names)
               = 100 mailboxes per shard
 
-1 Mailcheap VPS (port 25 open by default, cold email supported)
+1 Contabo VPS (port 25 open by default, cold email supported)
   └── docker-mailserver (Postfix + Dovecot + OpenDKIM + OpenDMARC)
         └── hosts all 20 subdomains as virtual domains
 ```
@@ -32,10 +32,16 @@ Hands-off after first-time setup: the deploy command takes a single `--domain` a
 5. Create and copy the token. **One token, every future domain.**
 6. Grab your **Account ID** from any domain's overview page (right sidebar).
 
-### 2. Mailcheap account
+### 2. Contabo account + API credentials
 
-1. Sign up at https://mailcheap.co, buy a VPS plan that allows Docker (≥1GB RAM).
-2. Generate an API key. Confirm port 25 is unblocked for cold email on that plan.
+1. Sign up at https://contabo.com and add a payment method. You will not buy a VPS in the UI — the script does that via API.
+2. Go to https://new.contabo.com/account/security → **API** section.
+3. Generate **API credentials**. You'll get four values:
+   - `Client ID`
+   - `Client Secret`
+   - `API User` (your Contabo login email, or a dedicated API username)
+   - `API Password` (a password you set specifically for API auth — not your account password)
+4. Note: port 25 is open by default on Contabo VPS. Their only technical limit is 25 emails/min, which is far above our volume (1000/day across 100 mailboxes = ~0.7/min peak).
 
 ### 3. Local environment
 
@@ -44,7 +50,7 @@ git clone <this-repo> && cd ColdEmailInfra
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# fill in the token, account ID, and Mailcheap key
+# fill in the token, account ID, and Contabo key
 ssh-keygen -t ed25519 -C "coldemail" -f ~/.ssh/id_ed25519 -N ""   # if you don't have one
 ```
 
@@ -58,7 +64,7 @@ That's it. The script:
 
 1. Checks if the domain is already on Cloudflare. If not, checks availability via the CF Registrar API, shows the price, and (with your confirmation) registers it at cost.
 2. Generates 20 subdomains + 100 mailboxes.
-3. Provisions a Mailcheap VPS and sets PTR to `mail.<domain>`.
+3. Provisions a Contabo VPS and sets PTR to `mail.<domain>`.
 4. Writes 123 DNS records (A/MX/SPF/DMARC/DKIM/redirect) via Cloudflare API.
 5. Installs docker-mailserver, creates mailboxes, generates 2048-bit DKIM keys, publishes them.
 6. Exports `shards/example.co.uk_bison.csv` for Email Bison import.

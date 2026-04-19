@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.cloudflare import CloudflareClient
-from lib.mailcheap import MailcheapClient
+from lib.contabo import ContaboClient
 from lib.state import ShardState, SHARDS_DIR
 
 
@@ -33,7 +33,7 @@ def main(domain: str, yes: bool) -> None:
     if vps and vps.get("id"):
         click.echo(f"Destroying VPS {vps['id']}")
         try:
-            MailcheapClient().destroy_vps(vps["id"])
+            ContaboClient().destroy_instance(vps["id"])
         except Exception as exc:
             click.echo(f"  VPS destroy warning: {exc}")
 
