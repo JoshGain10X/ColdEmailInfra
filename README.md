@@ -43,11 +43,7 @@ Hands-off after first-time setup: the deploy command takes a single `--domain` a
    - `CONTABO_API_USER` ← your Contabo login email
    - `CONTABO_API_PASSWORD` ← your Contabo login password
 5. Port 25 is open by default. Contabo's only technical limit is 25 emails/min, far above our volume (~0.7/min peak).
-6. **Pick a product ID before your first deploy.** After you've filled in `.env` with the four Contabo values, run:
-   ```bash
-   ./scripts/list_contabo_products.py --region EU
-   ```
-   This hits Contabo's API and prints a table of available productIds + regions. Pick the cheapest ≥2GB RAM option and paste it into `CONTABO_PRODUCT_ID=` in `.env`. (Contabo's catalog changes, so there's no hardcoded default.)
+6. **Product ID.** `.env.example` defaults to `CONTABO_PRODUCT_ID=V91` (current cheapest Cloud VPS, ~4GB RAM). If you get a `Product not available` error on deploy, Contabo's catalog has shifted — check https://contabo.com/en/vps/ for the current product lineup (IDs are in the V91–V107 range in 2025+), update `CONTABO_PRODUCT_ID=` in `.env`, and re-run.
 
 ### 3. Local environment
 

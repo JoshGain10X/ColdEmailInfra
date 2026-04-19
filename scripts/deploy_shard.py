@@ -118,8 +118,9 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
         if "not available" in body.lower() or "productid" in body.lower():
             raise click.ClickException(
                 f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
-                f"Run: ./scripts/list_contabo_products.py --region {region}\n"
-                f"Pick a valid productId from the output, then set CONTABO_PRODUCT_ID=<id> in .env and re-run deploy_shard."
+                f"Contabo does not expose a list-products API — pick a current productId from\n"
+                f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
+                f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
             )
         raise
     instance_id = inst.get("instanceId") or inst.get("id")
@@ -278,8 +279,8 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
 
 @click.command()
 @click.option("--domain", required=True, help="Root domain, e.g. example.co.uk (purchased via CF Registrar if not already yours)")
-@click.option("--contabo-product-id", default=lambda: os.environ.get("CONTABO_PRODUCT_ID", "V45"),
-              help="Contabo product ID. V45 = Cloud VPS 10 (4GB RAM, 2 vCPU, 50GB NVMe).")
+@click.option("--contabo-product-id", default=lambda: os.environ.get("CONTABO_PRODUCT_ID", "V91"),
+              help="Contabo product ID. V91 = current cheapest Cloud VPS. Check https://contabo.com/en/vps/ if this errors.")
 @click.option("--region", default=lambda: os.environ.get("CONTABO_REGION", "EU"),
               help="Contabo region. EU (Germany), US-central, US-east, US-west, SIN, UK.")
 @click.option("--image-id", default=lambda: os.environ.get("CONTABO_IMAGE_ID", "d64d5c6c-9dda-4e38-8174-0ee282474d8a"),
