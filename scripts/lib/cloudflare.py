@@ -12,8 +12,10 @@ API_BASE = "https://api.cloudflare.com/client/v4"
 
 class CloudflareClient:
     def __init__(self, token: str | None = None, account_id: str | None = None):
-        self.token = token or os.environ["CLOUDFLARE_API_TOKEN"]
-        self.account_id = account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        self.token = (token or os.environ["CLOUDFLARE_API_TOKEN"]).strip()
+        self.account_id = (account_id or os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip() or None
+        if not self.token:
+            raise RuntimeError("CLOUDFLARE_API_TOKEN is empty")
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.token}",

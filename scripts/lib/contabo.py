@@ -27,10 +27,10 @@ class ContaboClient:
         api_user: str | None = None,
         api_password: str | None = None,
     ):
-        self.client_id = client_id or os.environ["CONTABO_CLIENT_ID"]
-        self.client_secret = client_secret or os.environ["CONTABO_CLIENT_SECRET"]
-        self.api_user = api_user or os.environ["CONTABO_API_USER"]
-        self.api_password = api_password or os.environ["CONTABO_API_PASSWORD"]
+        self.client_id = (client_id or os.environ["CONTABO_CLIENT_ID"]).strip()
+        self.client_secret = (client_secret or os.environ["CONTABO_CLIENT_SECRET"]).strip()
+        self.api_user = (api_user or os.environ["CONTABO_API_USER"]).strip()
+        self.api_password = (api_password or os.environ["CONTABO_API_PASSWORD"]).strip()
         self._token: str | None = None
         self._token_expires: float = 0.0
         self.session = requests.Session()
