@@ -39,8 +39,14 @@ class CloudflareClient:
                 f"CLOUDFLARE_API_TOKEN contains unexpected characters: {', '.join(bad[:5])}. "
                 "Tokens are alphanumeric + dashes/underscores only. Re-copy from the Cloudflare dashboard."
             )
-        if len(cleaned) < 20:
-            raise RuntimeError(f"CLOUDFLARE_API_TOKEN is suspiciously short (len={len(cleaned)}). CF tokens are ~40 chars.")
+        if len(cleaned) < 30 or len(cleaned) > 60:
+            raise RuntimeError(
+                f"CLOUDFLARE_API_TOKEN has unexpected length (got {len(cleaned)}, "
+                "expected ~40 characters). You've likely pasted the wrong value — "
+                "go to https://dash.cloudflare.com/profile/api-tokens, click your "
+                "token's row, and copy ONLY the 40-character token string "
+                "(no 'Bearer ', no quotes, no surrounding text, not the Account ID)."
+            )
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         resp = self.session.request(method, f"{API_BASE}{path}", timeout=30, **kwargs)
