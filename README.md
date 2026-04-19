@@ -35,13 +35,14 @@ Hands-off after first-time setup: the deploy command takes a single `--domain` a
 ### 2. Contabo account + API credentials
 
 1. Sign up at https://contabo.com and add a payment method. You will not buy a VPS in the UI — the script does that via API.
-2. Go to https://new.contabo.com/account/security → **API** section.
-3. Generate **API credentials**. You'll get four values:
-   - `Client ID`
-   - `Client Secret`
-   - `API User` (your Contabo login email, or a dedicated API username)
-   - `API Password` (a password you set specifically for API auth — not your account password)
-4. Note: port 25 is open by default on Contabo VPS. Their only technical limit is 25 emails/min, which is far above our volume (1000/day across 100 mailboxes = ~0.7/min peak).
+2. Go to https://new.contabo.com/account/security → **API** section. Copy the `Client ID` and `Client Secret` (or regenerate if you haven't yet — that's fine, do it once, save the values).
+3. Contabo's API uses OAuth2 password grant, so the other two values are just your **portal login email** and **portal login password**. That's it — no separate "API user" to create.
+4. You'll end up with four values total:
+   - `CONTABO_CLIENT_ID` ← from the API security page
+   - `CONTABO_CLIENT_SECRET` ← from the API security page
+   - `CONTABO_API_USER` ← your Contabo login email
+   - `CONTABO_API_PASSWORD` ← your Contabo login password
+5. Port 25 is open by default. Contabo's only technical limit is 25 emails/min, far above our volume (~0.7/min peak).
 
 ### 3. Local environment
 
