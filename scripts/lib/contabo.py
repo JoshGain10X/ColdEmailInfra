@@ -84,9 +84,12 @@ class ContaboClient:
     # ------------------------------------------------------------------
 
     def find_or_create_ssh_key(self, name: str, public_key: str) -> int:
+        public_key_stripped = public_key.strip()
         body = self._request("GET", "/secrets", params={"type": "ssh", "size": 100})
         for s in body.get("data", []):
-            if s.get("value", "").strip() == public_key.strip():
+            # Contabo's list response may not include the full key value for security,
+            # so match by name as well. Either hit reuses the existing secret.
+            if s.get("name") == name or s.get("value", "").strip() == public_key_stripped:
                 return s["secretId"]
         body = self._request("POST", "/secrets", json={
             "name": name,
