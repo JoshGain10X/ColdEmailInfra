@@ -120,19 +120,28 @@ class MailserverClient:
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")
         self._wait_for_container("mailserver")
 
-    def _wait_for_container(self, name: str, timeout: int = 180) -> None:
+    def _wait_for_container(self, name: str, timeout: int = 300) -> None:
         start = time.time()
+        last_status = ""
         while time.time() - start < timeout:
             _, out, _ = self.sudo(
-                f"sh -c \"docker inspect -f '{{{{.State.Health.Status}}}}' {name} 2>/dev/null || "
-                f"docker inspect -f '{{{{.State.Status}}}}' {name}\"",
+                f"docker inspect -f '{{{{.State.Status}}}}' {name}",
                 check=False,
             )
-            status = out.strip()
-            if status in ("healthy", "running"):
+            last_status = out.strip()
+            if last_status == "running":
                 return
+            if last_status in ("exited", "dead"):
+                _, logs, _ = self.sudo(f"docker logs --tail 80 {name}", check=False)
+                raise RuntimeError(
+                    f"Container {name} is {last_status}. Last 80 log lines:\n{logs}"
+                )
             time.sleep(5)
-        raise TimeoutError(f"Container {name} did not become healthy within {timeout}s")
+        _, logs, _ = self.sudo(f"docker logs --tail 80 {name}", check=False)
+        raise TimeoutError(
+            f"Container {name} did not reach running state within {timeout}s "
+            f"(last seen: {last_status}). Last 80 log lines:\n{logs}"
+        )
 
     def add_mailbox(self, email: str, password: str) -> None:
         safe_pw = password.replace("'", "'\\''")
