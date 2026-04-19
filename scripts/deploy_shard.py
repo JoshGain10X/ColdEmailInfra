@@ -214,7 +214,13 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
             f"v=DMARC1; p=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
         )
 
-    cf.ensure_redirect_rule(zone_id, domain, redirect_target)
+    try:
+        cf.ensure_redirect_rule(zone_id, domain, redirect_target)
+    except RuntimeError as exc:
+        click.echo(f"  WARNING: could not auto-create redirect rule ({exc}).")
+        click.echo(f"  Add it manually: Cloudflare dashboard -> {domain} -> Rules -> Redirect Rules -> Create Rule")
+        click.echo(f"                   Match: Hostname equals '{domain}'  ->  Static redirect 301 -> {redirect_target}")
+        click.echo(f"  Cold email does not depend on this; the shard can finish without it.")
     state.mark_step_done("configure_dns")
 
 
