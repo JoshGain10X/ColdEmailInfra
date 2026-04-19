@@ -126,6 +126,14 @@ class ContaboClient:
         body = self._request("GET", f"/compute/instances/{instance_id}")
         return body["data"][0]
 
+    def find_instance_by_display_name(self, display_name: str) -> dict | None:
+        """Return the first instance matching the given display name, or None."""
+        body = self._request("GET", "/compute/instances", params={"size": 100})
+        for inst in body.get("data", []):
+            if inst.get("displayName") == display_name:
+                return inst
+        return None
+
     def wait_for_instance_ready(self, instance_id: int, timeout: int = 900) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:

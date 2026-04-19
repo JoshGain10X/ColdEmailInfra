@@ -102,28 +102,52 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
         return
     click.echo("[2/10] Provisioning Contabo VPS")
     cb = ContaboClient()
+    display_name = _mail_hostname(domain)
     ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
     public_key = ssh_pub_path.read_text().strip()
     ssh_key_id = cb.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
-    try:
-        inst = cb.create_instance(
-            display_name=_mail_hostname(domain),
-            product_id=product_id,
-            region=region,
-            ssh_key_id=ssh_key_id,
-            image_id=image_id,
-        )
-    except requests.HTTPError as exc:
-        body = exc.response.text if exc.response is not None else str(exc)
-        if "not available" in body.lower() or "productid" in body.lower():
-            raise click.ClickException(
-                f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
-                f"Contabo does not expose a list-products API — pick a current productId from\n"
-                f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
-                f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
+
+    # 1) Check state for an instance ID we already acquired on a prior run
+    vps_state = state.get("vps") or {}
+    instance_id = vps_state.get("id")
+
+    # 2) If not, look for an orphan instance with the same display name
+    if not instance_id:
+        existing = cb.find_instance_by_display_name(display_name)
+        if existing:
+            instance_id = existing.get("instanceId") or existing.get("id")
+            click.echo(f"  Found existing Contabo instance {instance_id} (displayName '{display_name}'), reusing")
+
+    # 3) Otherwise create a fresh one
+    if not instance_id:
+        try:
+            inst = cb.create_instance(
+                display_name=display_name,
+                product_id=product_id,
+                region=region,
+                ssh_key_id=ssh_key_id,
+                image_id=image_id,
             )
-        raise
-    instance_id = inst.get("instanceId") or inst.get("id")
+        except requests.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else str(exc)
+            if "not available" in body.lower() or "productid" in body.lower():
+                raise click.ClickException(
+                    f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
+                    f"Contabo does not expose a list-products API — pick a current productId from\n"
+                    f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
+                    f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
+                )
+            raise
+        instance_id = inst.get("instanceId") or inst.get("id")
+
+    # Save the instance ID immediately so future re-runs can recover even if the next step fails
+    state.set("vps", {
+        "id": instance_id,
+        "ip": vps_state.get("ip"),
+        "product_id": product_id,
+        "region": region,
+    })
+
     inst = cb.wait_for_instance_ready(instance_id)
     ip = ((inst.get("ipConfig") or {}).get("v4") or {}).get("ip")
     state.set("vps", {
