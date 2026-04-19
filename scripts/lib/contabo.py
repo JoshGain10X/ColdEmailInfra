@@ -96,6 +96,23 @@ class ContaboClient:
         return body["data"][0]["secretId"]
 
     # ------------------------------------------------------------------
+    # Product availability
+    # ------------------------------------------------------------------
+
+    def list_product_availability(self, region: str | None = None, size: int = 100) -> list[dict]:
+        """Return the list of productId + region combinations that are currently available.
+
+        Endpoint: GET /compute/instances/availabilities
+        Response data shape (Contabo API v1): list of {productId, displayName, region, specs, ...}.
+        If the endpoint shape differs, _request will raise with the body for debugging.
+        """
+        params: dict[str, Any] = {"size": size}
+        if region:
+            params["region"] = region
+        body = self._request("GET", "/compute/instances/availabilities", params=params)
+        return body.get("data", [])
+
+    # ------------------------------------------------------------------
     # Compute instances
     # ------------------------------------------------------------------
 

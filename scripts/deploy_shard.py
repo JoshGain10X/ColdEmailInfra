@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 import dns.resolver
 import dns.reversename
+import requests
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -104,13 +105,23 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
     ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
     public_key = ssh_pub_path.read_text().strip()
     ssh_key_id = cb.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
-    inst = cb.create_instance(
-        display_name=_mail_hostname(domain),
-        product_id=product_id,
-        region=region,
-        ssh_key_id=ssh_key_id,
-        image_id=image_id,
-    )
+    try:
+        inst = cb.create_instance(
+            display_name=_mail_hostname(domain),
+            product_id=product_id,
+            region=region,
+            ssh_key_id=ssh_key_id,
+            image_id=image_id,
+        )
+    except requests.HTTPError as exc:
+        body = exc.response.text if exc.response is not None else str(exc)
+        if "not available" in body.lower() or "productid" in body.lower():
+            raise click.ClickException(
+                f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
+                f"Run: ./scripts/list_contabo_products.py --region {region}\n"
+                f"Pick a valid productId from the output, then set CONTABO_PRODUCT_ID=<id> in .env and re-run deploy_shard."
+            )
+        raise
     instance_id = inst.get("instanceId") or inst.get("id")
     inst = cb.wait_for_instance_ready(instance_id)
     ip = (inst.get("ipConfig", {}).get("v4", {}) or {}).get("ip")
