@@ -22,10 +22,17 @@ class CloudflareClient:
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         resp = self.session.request(method, f"{API_BASE}{path}", timeout=30, **kwargs)
-        resp.raise_for_status()
-        body = resp.json()
-        if not body.get("success", True):
-            raise RuntimeError(f"Cloudflare API error: {body.get('errors')}")
+        try:
+            body = resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Cloudflare HTTP {resp.status_code} on {method} {path}: {resp.text[:500]}"
+            )
+        if resp.status_code >= 400 or not body.get("success", True):
+            errors = body.get("errors") or body.get("messages") or body
+            raise RuntimeError(
+                f"Cloudflare API {resp.status_code} on {method} {path}: {errors}"
+            )
         return body
 
     # ------------------------------------------------------------------
