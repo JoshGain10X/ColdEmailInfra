@@ -163,9 +163,13 @@ class MailserverClient:
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
 
-        # Acquire Let's Encrypt cert via DNS-01 (no port 80 needed, works even
-        # if the hostname's A record isn't yet pointing at this VPS).
-        self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
+        # NOTE: Let's Encrypt cert acquisition is intentionally skipped.
+        # mailserver.env has SSL_TYPE=self-signed, so docker-mailserver
+        # generates its own cert at boot. To re-enable LE later: flip
+        # SSL_TYPE back to 'letsencrypt' in mailserver.env and call
+        # self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
+        # here before compose pull.
+        _ = cf_api_token  # reserved for re-enabling LE later
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")
