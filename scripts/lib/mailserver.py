@@ -142,6 +142,30 @@ class MailserverClient:
                 f"--- Last 80 lines of /var/log/letsencrypt/letsencrypt.log ---\n{log}"
             )
 
+    def acquire_self_signed_cert(self, hostname: str) -> None:
+        """Generate a self-signed cert for `hostname` into the DMS ssl dir.
+
+        docker-mailserver's SSL_TYPE=self-signed is Bring-Your-Own: it expects
+        these files at /tmp/docker-mailserver/ssl/ (mounted from the host):
+          - <hostname>-key.pem       (private key)
+          - <hostname>-cert.pem      (cert)
+          - demoCA/cacert.pem        (CA cert; same as cert for self-signed)
+        Generated on the host so the container can mount them read-only.
+        Idempotent — skips regeneration if both key and cert already exist.
+        """
+        ssl_dir = f"{self._workdir()}/docker-data/dms/config/ssl"
+        key = f"{ssl_dir}/{hostname}-key.pem"
+        crt = f"{ssl_dir}/{hostname}-cert.pem"
+        self.run(f"mkdir -p {ssl_dir}/demoCA")
+        self.run(
+            f"( test -f {key} && test -f {crt} ) || "
+            f"openssl req -x509 -newkey rsa:4096 -nodes -days 3650 "
+            f"-keyout {key} -out {crt} "
+            f'-subj "/CN={hostname}" '
+            f'-addext "subjectAltName=DNS:{hostname}"'
+        )
+        self.run(f"cp {crt} {ssl_dir}/demoCA/cacert.pem")
+
     def install_dms(self, root_domain: str, le_email: str, cf_api_token: str) -> None:
         workdir = self._workdir()
         self.run(
@@ -163,13 +187,13 @@ class MailserverClient:
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
 
-        # NOTE: Let's Encrypt cert acquisition is intentionally skipped.
-        # mailserver.env has SSL_TYPE=self-signed, so docker-mailserver
-        # generates its own cert at boot. To re-enable LE later: flip
-        # SSL_TYPE back to 'letsencrypt' in mailserver.env and call
-        # self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
-        # here before compose pull.
-        _ = cf_api_token  # reserved for re-enabling LE later
+        # SSL_TYPE=self-signed in docker-mailserver v15+ is Bring-Your-Own — it
+        # expects cert + key files to already exist in the mounted ssl dir.
+        # Generate them here (idempotent) before starting the container.
+        self.acquire_self_signed_cert(f"mail.{root_domain}")
+
+        # Keep the cf_api_token arg for when we re-enable LE later.
+        _ = cf_api_token
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")
