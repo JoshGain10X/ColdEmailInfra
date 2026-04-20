@@ -124,11 +124,14 @@ class MailserverClient:
         self.sudo(f"sh -c 'umask 077 && echo {b64} | base64 -d > {creds_path}'")
         self.sudo(f"chmod 600 {creds_path}")
 
+        # propagation-seconds=600 so the new TXT record stays live past LE
+        # resolvers' negative-cache window (~5 min per CF's SOA minimum).
+        # Shorter values race the cached NXDOMAIN from an earlier attempt.
         try:
             self.sudo(
                 f"certbot certonly --dns-cloudflare "
                 f"--dns-cloudflare-credentials {creds_path} "
-                f"--dns-cloudflare-propagation-seconds 120 "
+                f"--dns-cloudflare-propagation-seconds 600 "
                 f"--non-interactive --agree-tos --email {email} "
                 f"-d {hostname} --keep-until-expiring"
             )
