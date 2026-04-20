@@ -93,27 +93,44 @@ class MailserverClient:
         # Install Docker if not present. get.docker.com detects sudo automatically.
         self.run("command -v docker >/dev/null || (curl -fsSL https://get.docker.com | sudo -n sh)")
         self.sudo("systemctl enable --now docker")
-        # Also install certbot for Let's Encrypt cert acquisition.
+        # Also install certbot + Cloudflare DNS plugin for Let's Encrypt via DNS-01.
         self.sudo("apt-get update -qq", check=False)
-        self.sudo("apt-get install -y certbot")
+        self.sudo("apt-get install -y certbot python3-certbot-dns-cloudflare")
         # Add the login user to the docker group so subsequent docker commands
         # don't need sudo. Takes effect on new sessions, so we still use sudo
         # for docker commands in this session.
         self.sudo(f"usermod -aG docker {self.user}", check=False)
 
-    def acquire_letsencrypt_cert(self, hostname: str, email: str) -> None:
-        """Acquire a Let's Encrypt cert for `hostname` via HTTP-01 on port 80.
+    def acquire_letsencrypt_cert(self, hostname: str, email: str, cf_api_token: str) -> None:
+        """Acquire a Let's Encrypt cert for `hostname` via Cloudflare DNS-01.
 
-        Idempotent: if the cert already exists and is valid, certbot is a no-op.
-        Port 80 must be free on the VPS (it is on a fresh Contabo image).
-        DNS A record for `hostname` must already point at this VPS.
+        Avoids the port-80 HTTP-01 challenge entirely — useful when the
+        hostname's A record doesn't resolve to this VPS (e.g. zone still
+        has stale records from a previous host), when port 80 is proxied
+        through Cloudflare, or when any edge rule returns non-200 on
+        /.well-known/acme-challenge/.
+
+        Requires a Cloudflare API token with Zone:DNS:Edit permission
+        (our deploy token already has this).
+
+        Idempotent — `--keep-until-expiring` makes certbot a no-op if the
+        cert is present and >30 days from expiry.
         """
+        creds_path = "/root/.cf-certbot.ini"
+        creds = f"dns_cloudflare_api_token = {cf_api_token}\n"
+        # Write via sudo tee so the file lives as root:root with mode 600
+        escaped = creds.replace("'", "'\\''")
+        self.sudo(f"sh -c 'umask 077 && echo \"{escaped.strip()}\" > {creds_path}'")
+        self.sudo(f"chmod 600 {creds_path}")
         self.sudo(
-            f"certbot certonly --standalone --non-interactive --agree-tos "
-            f"--email {email} -d {hostname} --keep-until-expiring"
+            f"certbot certonly --dns-cloudflare "
+            f"--dns-cloudflare-credentials {creds_path} "
+            f"--dns-cloudflare-propagation-seconds 60 "
+            f"--non-interactive --agree-tos --email {email} "
+            f"-d {hostname} --keep-until-expiring"
         )
 
-    def install_dms(self, root_domain: str, le_email: str) -> None:
+    def install_dms(self, root_domain: str, le_email: str, cf_api_token: str) -> None:
         workdir = self._workdir()
         self.run(
             f"mkdir -p {workdir}/docker-data/dms/config "
@@ -134,9 +151,9 @@ class MailserverClient:
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
 
-        # Acquire Let's Encrypt cert BEFORE starting the container so port 80 is
-        # free for HTTP-01 challenge and SSL_TYPE=letsencrypt has certs on disk.
-        self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email)
+        # Acquire Let's Encrypt cert via DNS-01 (no port 80 needed, works even
+        # if the hostname's A record isn't yet pointing at this VPS).
+        self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")

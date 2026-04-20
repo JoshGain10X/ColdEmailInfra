@@ -246,7 +246,7 @@ def _step_install_mailserver(state: ShardState, domain: str) -> None:
                 return
             click.echo("  mailserver container is not healthy — re-running install to fix")
         ms.install_docker()
-        ms.install_dms(domain, le_email)
+        ms.install_dms(domain, le_email, os.environ["CLOUDFLARE_API_TOKEN"].strip())
     finally:
         ms.close()
     state.mark_step_done("install_mailserver")
