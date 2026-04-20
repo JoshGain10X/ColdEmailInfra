@@ -202,6 +202,11 @@ class ContaboClient:
         )
 
     def destroy_instance(self, instance_id: int) -> None:
-        # Contabo rejects DELETE with empty body + application/json content-type
-        # ("Body cannot be empty"); send {} to satisfy the validator.
-        self._request("DELETE", f"/compute/instances/{instance_id}", json={})
+        """Cancel a Contabo instance. Billing stops at the end of the current
+        billing period; the instance remains listed until then.
+
+        Endpoint: POST /v1/compute/instances/{instanceId}/cancel
+        (DELETE was deprecated — it now returns Express-style 404
+        "Cannot DELETE /v1/...". The /cancel POST is the current path.)
+        """
+        self._request("POST", f"/compute/instances/{instance_id}/cancel", json={})
