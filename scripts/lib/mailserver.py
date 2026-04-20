@@ -100,11 +100,22 @@ class MailserverClient:
 
         Uses `cloud-init status --wait`, which is purpose-built for this race.
         No-ops if cloud-init isn't installed (non-Ubuntu images, etc).
+
+        Note: cloud-init uses exit code 2 for "done with recoverable errors"
+        (common on stock cloud images — e.g. a service reload that no-ops).
+        The dpkg lock is released regardless, so we key off the 'status: done'
+        line in stdout rather than the exit code.
         """
-        self.sudo(
-            f"sh -c 'command -v cloud-init >/dev/null || exit 0; "
-            f"timeout {timeout} cloud-init status --wait'",
+        rc, out, err = self.sudo(
+            f"sh -c 'command -v cloud-init >/dev/null || {{ echo status: done; exit 0; }}; "
+            f"timeout {timeout} cloud-init status --wait; true'",
+            check=False,
         )
+        if "status: done" not in out:
+            raise RuntimeError(
+                f"cloud-init did not reach 'done' within {timeout}s "
+                f"(rc={rc})\nstdout: {out}\nstderr: {err}"
+            )
 
     def install_docker(self) -> None:
         self.wait_for_cloud_init()
