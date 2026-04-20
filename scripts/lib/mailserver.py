@@ -166,7 +166,16 @@ class MailserverClient:
         )
         self.run(f"cp {crt} {ssl_dir}/demoCA/cacert.pem")
 
-    def install_dms(self, root_domain: str, le_email: str, cf_api_token: str) -> None:
+    def install_dms(
+        self,
+        root_domain: str,
+        le_email: str,
+        cf_api_token: str,
+        ssl_type: str = "self-signed",
+    ) -> None:
+        if ssl_type not in ("self-signed", "letsencrypt"):
+            raise ValueError(f"ssl_type must be 'self-signed' or 'letsencrypt', got {ssl_type!r}")
+
         workdir = self._workdir()
         self.run(
             f"mkdir -p {workdir}/docker-data/dms/config "
@@ -182,18 +191,18 @@ class MailserverClient:
 
         env = (DMS_TEMPLATE_DIR / "mailserver.env").read_text()
         env = env.replace("__MAIL_HOSTNAME__", f"mail.{root_domain}")
+        env = env.replace("__SSL_TYPE__", ssl_type)
         self.upload_text(env, f"{workdir}/mailserver.env")
 
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
 
-        # SSL_TYPE=self-signed in docker-mailserver v15+ is Bring-Your-Own — it
-        # expects cert + key files to already exist in the mounted ssl dir.
-        # Generate them here (idempotent) before starting the container.
-        self.acquire_self_signed_cert(f"mail.{root_domain}")
-
-        # Keep the cf_api_token arg for when we re-enable LE later.
-        _ = cf_api_token
+        # Acquire certs before starting the container so docker-mailserver's
+        # startup checks find them on disk.
+        if ssl_type == "letsencrypt":
+            self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
+        else:
+            self.acquire_self_signed_cert(f"mail.{root_domain}")
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")

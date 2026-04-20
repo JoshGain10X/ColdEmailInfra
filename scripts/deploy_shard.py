@@ -224,8 +224,8 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
     state.mark_step_done("configure_dns")
 
 
-def _step_install_mailserver(state: ShardState, domain: str) -> None:
-    click.echo("[5/10] Installing docker-mailserver on VPS")
+def _step_install_mailserver(state: ShardState, domain: str, ssl_type: str) -> None:
+    click.echo(f"[5/10] Installing docker-mailserver on VPS (ssl_type={ssl_type})")
     vps = state.get("vps")
     le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
@@ -246,7 +246,12 @@ def _step_install_mailserver(state: ShardState, domain: str) -> None:
                 return
             click.echo("  mailserver container is not healthy — re-running install to fix")
         ms.install_docker()
-        ms.install_dms(domain, le_email, os.environ["CLOUDFLARE_API_TOKEN"].strip())
+        ms.install_dms(
+            domain,
+            le_email,
+            os.environ["CLOUDFLARE_API_TOKEN"].strip(),
+            ssl_type=ssl_type,
+        )
     finally:
         ms.close()
     state.mark_step_done("install_mailserver")
@@ -334,7 +339,18 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
               help="Contabo image ID. Default is Ubuntu 22.04 LTS.")
 @click.option("--skip-purchase", is_flag=True, help="Error out if domain isn't already on Cloudflare (don't buy via Registrar)")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip interactive confirmations (e.g. domain purchase)")
-def main(domain: str, contabo_product_id: str, region: str, image_id: str, skip_purchase: bool, assume_yes: bool) -> None:
+@click.option("--ssl-type", type=click.Choice(["self-signed", "letsencrypt"]),
+              default=lambda: os.environ.get("SSL_TYPE", "self-signed"),
+              help="TLS cert strategy. 'self-signed' = docker-mailserver uses a cert we generate (default, Bison skips verification). 'letsencrypt' = real cert via Cloudflare DNS-01 challenge.")
+def main(
+    domain: str,
+    contabo_product_id: str,
+    region: str,
+    image_id: str,
+    skip_purchase: bool,
+    assume_yes: bool,
+    ssl_type: str,
+) -> None:
     _load_env()
     state = ShardState(domain)
     zone_id = _step_ensure_domain(state, domain, skip_purchase, assume_yes)
@@ -342,7 +358,7 @@ def main(domain: str, contabo_product_id: str, region: str, image_id: str, skip_
     _step_provision_vps(state, domain, contabo_product_id, region, image_id)
     _step_set_ptr(state, domain)
     _step_configure_dns(state, domain, zone_id)
-    _step_install_mailserver(state, domain)
+    _step_install_mailserver(state, domain, ssl_type)
     _step_create_mailboxes(state)
     _step_setup_dkim(state, domain, zone_id)
     _step_export_bison(state, domain)
