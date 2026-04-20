@@ -253,7 +253,20 @@ class MailserverClient:
 
     def add_mailbox(self, email: str, password: str) -> None:
         safe_pw = password.replace("'", "'\\''")
-        self.sudo(f"docker exec mailserver setup email add '{email}' '{safe_pw}'")
+        rc, out, err = self.sudo(
+            f"docker exec mailserver setup email add '{email}' '{safe_pw}'",
+            check=False,
+        )
+        if rc == 0:
+            return
+        combined = f"{out}\n{err}"
+        if "already exists" in combined.lower():
+            # Persisted from a prior partial run — sync the password to state.
+            self.sudo(
+                f"docker exec mailserver setup email update '{email}' '{safe_pw}'"
+            )
+            return
+        raise RuntimeError(f"add_mailbox failed ({rc}) for {email}: {combined.strip()}")
 
     def setup_dkim(self, subdomain_fqdn: str, keysize: int = 2048) -> str:
         """Run DKIM key generation for a given subdomain FQDN; return the public key DNS value."""
