@@ -157,13 +157,29 @@ class ContaboClient:
                 time.sleep(5)
         raise TimeoutError(f"SSH on {ip}:{port} not reachable within {timeout}s")
 
+    def get_ptr(self, ip: str) -> str | None:
+        """Return Contabo's configured PTR for an IP, or None if unset/missing."""
+        try:
+            body = self._request("GET", f"/dns/ptrs/{ip}")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+        data = body.get("data") or []
+        if not data:
+            return None
+        first = data[0]
+        return first.get("ptr") or first.get("data") or None
+
     def set_ptr(self, instance_id: int, hostname: str) -> None:
-        """Set reverse DNS for the instance's primary IPv4 via the DNS PTR API.
+        """Set reverse DNS and confirm Contabo's side has it configured.
 
         Endpoint (verified against Contabo's cntb CLI source):
           PUT /v1/dns/ptrs/{ipAddress}   body: {"ptr": "<hostname>"}
-        For IPv4 the default PTR is created at instance provisioning, so we
-        only need to UPDATE (PUT). POST /v1/dns/ptrs is IPv6-only per the API.
+        Public DNS propagation can take 30-60 min for new IPs, but once Contabo's
+        API returns the expected value from GET /dns/ptrs/{ip}, the server side
+        is done. We don't wait on public DNS here — that's cosmetic until mail
+        sending actually begins (days later via Bison warmup).
         """
         inst = self.get_instance(instance_id)
         v4 = (inst.get("ipConfig") or {}).get("v4") or {}
@@ -171,6 +187,19 @@ class ContaboClient:
         if not ip:
             raise RuntimeError(f"Instance {instance_id} has no IPv4 address yet")
         self._request("PUT", f"/dns/ptrs/{ip}", json={"ptr": hostname})
+
+        # Confirm via Contabo API (usually immediate; poll briefly for safety).
+        deadline = time.time() + 60
+        last_seen: str | None = None
+        while time.time() < deadline:
+            last_seen = self.get_ptr(ip)
+            if last_seen == hostname:
+                return
+            time.sleep(5)
+        raise RuntimeError(
+            f"Contabo did not confirm PTR {hostname} for {ip} within 60s "
+            f"(last seen: {last_seen!r}). Check dashboard."
+        )
 
     def destroy_instance(self, instance_id: int) -> None:
         self._request("DELETE", f"/compute/instances/{instance_id}")

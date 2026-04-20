@@ -169,39 +169,38 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
     hostname = _mail_hostname(domain)
     rev = dns.reversename.from_address(vps["ip"])
 
-    # Check current PTR first — maybe already correct from a previous run.
+    # Fast-path 1: public DNS already shows the right PTR (previous run propagated).
     try:
         current = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
-        click.echo(f"  Current PTR for {vps['ip']}: {current}")
         if current == hostname:
-            click.echo("  PTR already correct, skipping update")
+            click.echo(f"  Public PTR already {hostname}, skipping update")
             state.mark_step_done("set_ptr")
             return
     except Exception:
-        click.echo(f"  Current PTR for {vps['ip']}: (no resolution yet)")
+        current = None
 
-    click.echo(f"  Setting PTR to {hostname} via Contabo API")
-    cb.set_ptr(vps["id"], hostname)
+    # Fast-path 2: Contabo already has it on file (previous run pushed but public DNS slow).
+    contabo_current = cb.get_ptr(vps["ip"])
+    if contabo_current == hostname:
+        click.echo(f"  Contabo PTR already {hostname} (public DNS still propagating)")
+    else:
+        click.echo(f"  Setting PTR to {hostname} via Contabo API")
+        cb.set_ptr(vps["id"], hostname)  # Confirms via Contabo API internally
 
-    deadline = time.time() + 1800  # 30 min — Contabo rDNS for fresh IPs can be slow
-    last_current = ""
-    while time.time() < deadline:
-        try:
-            last_current = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
-            if last_current == hostname:
-                state.mark_step_done("set_ptr")
-                return
-        except Exception:
-            pass
-        time.sleep(30)
-    raise click.ClickException(
-        f"PTR did not propagate to {hostname} within 30 min "
-        f"(currently resolves to: {last_current or '(nothing)'}).\n"
-        f"Contabo's rDNS can take longer for fresh IPs. Verify manually:\n"
-        f"  dig +short -x {vps['ip']}\n"
-        f"If it shows the right hostname, re-run this command — step 3 will fast-path. "
-        f"Otherwise wait 30-60 min and retry."
-    )
+    # Best-effort public DNS report — does not block deploy.
+    try:
+        public_now = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
+    except Exception:
+        public_now = None
+    if public_now == hostname:
+        click.echo(f"  Public DNS matches: {hostname}")
+    else:
+        click.echo(
+            f"  Contabo has PTR set. Public DNS still shows "
+            f"{public_now or '(nothing)'} — will propagate in 30–60 min. "
+            f"Does not block deploy."
+        )
+    state.mark_step_done("set_ptr")
 
 
 def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
