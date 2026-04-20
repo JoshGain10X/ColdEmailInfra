@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import secrets
 import time
 from pathlib import Path
 
@@ -166,6 +167,31 @@ class MailserverClient:
         )
         self.run(f"cp {crt} {ssl_dir}/demoCA/cacert.pem")
 
+    def seed_postmaster_account(self, root_domain: str) -> str:
+        """Write a postmaster account to postfix-accounts.cf so Dovecot starts.
+
+        docker-mailserver v15 refuses to boot Dovecot without at least one
+        account and gives a 120s grace window before shutting down. Seeding
+        one account on the host before `docker compose up` bypasses this
+        chicken-and-egg so the container hits healthy and step 6 can then
+        docker exec to add the 100 real mailboxes.
+
+        Returns the generated password, or empty string if a file already
+        exists with content (idempotent).
+        """
+        accounts_file = f"{self._workdir()}/docker-data/dms/config/postfix-accounts.cf"
+        self.run(f"mkdir -p $(dirname {accounts_file})")
+        rc, _, _ = self.run(f"test -s {accounts_file}", check=False)
+        if rc == 0:
+            return ""
+        email = f"postmaster@mail.{root_domain}"
+        password = secrets.token_urlsafe(24)
+        _, hash_out, _ = self.run(f"openssl passwd -6 '{password}'")
+        pw_hash = hash_out.strip()
+        line = f"{email}|{{SHA512-CRYPT}}{pw_hash}\n"
+        self.upload_text(line, accounts_file)
+        return password
+
     def install_dms(
         self,
         root_domain: str,
@@ -203,6 +229,12 @@ class MailserverClient:
             self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
         else:
             self.acquire_self_signed_cert(f"mail.{root_domain}")
+
+        # Seed a postmaster account so Dovecot starts on first boot. Without at
+        # least one account, docker-mailserver v15 shuts down after a 120s grace
+        # window — and since step 6 (docker exec setup email add) can't run
+        # until the container is healthy, we'd deadlock.
+        self.seed_postmaster_account(root_domain)
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")
