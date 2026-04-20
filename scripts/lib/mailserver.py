@@ -90,7 +90,24 @@ class MailserverClient:
     def upload_file(self, local_path: Path, remote_path: str) -> None:
         self.upload_text(local_path.read_text(), remote_path)
 
+    def wait_for_cloud_init(self, timeout: int = 600) -> None:
+        """Block until cloud-init has finished on a fresh VPS.
+
+        Contabo's Ubuntu image runs cloud-init on first boot, which holds
+        /var/lib/dpkg/lock-frontend for 1–5 min. contabo.wait_for_ssh() only
+        waits for port 22, so without this wait install_docker's `curl | sh`
+        races cloud-init on apt and fails with exit 100 "Could not get lock".
+
+        Uses `cloud-init status --wait`, which is purpose-built for this race.
+        No-ops if cloud-init isn't installed (non-Ubuntu images, etc).
+        """
+        self.sudo(
+            f"sh -c 'command -v cloud-init >/dev/null || exit 0; "
+            f"timeout {timeout} cloud-init status --wait'",
+        )
+
     def install_docker(self) -> None:
+        self.wait_for_cloud_init()
         # Install Docker if not present. get.docker.com detects sudo automatically.
         self.run("command -v docker >/dev/null || (curl -fsSL https://get.docker.com | sudo -n sh)")
         self.sudo("systemctl enable --now docker")
