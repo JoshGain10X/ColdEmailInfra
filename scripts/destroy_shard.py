@@ -40,9 +40,11 @@ def main(domain: str, yes: bool) -> None:
     cf = CloudflareClient()
     zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)
     if zone_id:
-        click.echo(f"Removing DNS records for {domain} (zone {zone_id})")
-        removed = cf.delete_records_matching(zone_id, domain)
-        click.echo(f"  Removed {removed} records")
+        click.echo(f"Stripping zone {domain} (zone {zone_id})")
+        removed = cf.delete_all_records(zone_id)
+        click.echo(f"  Removed {removed} DNS records")
+        removed_rules = cf.delete_redirect_rules(zone_id, domain)
+        click.echo(f"  Removed {removed_rules} redirect rules")
     else:
         click.echo(f"  No Cloudflare zone found for {domain}; skipping DNS cleanup")
 

@@ -173,14 +173,31 @@ class CloudflareClient:
         body = self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
         return body["result"]
 
-    def delete_records_matching(self, zone_id: str, suffix: str) -> int:
-        """Delete every DNS record whose name ends with `suffix`. Returns count."""
+    def delete_all_records(self, zone_id: str) -> int:
+        """Delete every DNS record in the zone. Returns count."""
         records = self.list_records(zone_id)
-        removed = 0
         for r in records:
-            if r["name"] == suffix or r["name"].endswith(f".{suffix}"):
-                self._request("DELETE", f"/zones/{zone_id}/dns_records/{r['id']}")
-                removed += 1
+            self._request("DELETE", f"/zones/{zone_id}/dns_records/{r['id']}")
+        return len(records)
+
+    def delete_redirect_rules(self, zone_id: str, source_domain: str) -> int:
+        """Remove redirect rules whose description was created by ensure_redirect_rule
+        for `source_domain`. Returns count of rules removed."""
+        phase = "http_request_dynamic_redirect"
+        try:
+            body = self._request("GET", f"/zones/{zone_id}/rulesets/phases/{phase}/entrypoint")
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return 0
+            raise
+        ruleset = body.get("result") or {}
+        ruleset_id = ruleset.get("id")
+        existing_rules = ruleset.get("rules") or []
+        prefix = f"Redirect {source_domain} to "
+        kept = [r for r in existing_rules if not (r.get("description") or "").startswith(prefix)]
+        removed = len(existing_rules) - len(kept)
+        if removed and ruleset_id:
+            self._request("PUT", f"/zones/{zone_id}/rulesets/{ruleset_id}", json={"rules": kept})
         return removed
 
     def ensure_redirect_rule(self, zone_id: str, source_domain: str, target: str) -> None:
