@@ -110,25 +110,34 @@ class MailserverClient:
         through Cloudflare, or when any edge rule returns non-200 on
         /.well-known/acme-challenge/.
 
-        Requires a Cloudflare API token with Zone:DNS:Edit permission
-        (our deploy token already has this).
+        Requires a Cloudflare API token with Zone:DNS:Edit + Zone:Zone:Read
+        (our deploy token already has both).
 
         Idempotent — `--keep-until-expiring` makes certbot a no-op if the
         cert is present and >30 days from expiry.
         """
+        import base64
         creds_path = "/root/.cf-certbot.ini"
         creds = f"dns_cloudflare_api_token = {cf_api_token}\n"
-        # Write via sudo tee so the file lives as root:root with mode 600
-        escaped = creds.replace("'", "'\\''")
-        self.sudo(f"sh -c 'umask 077 && echo \"{escaped.strip()}\" > {creds_path}'")
+        # Base64-encode to avoid any shell quoting / $ expansion issues.
+        b64 = base64.b64encode(creds.encode()).decode()
+        self.sudo(f"sh -c 'umask 077 && echo {b64} | base64 -d > {creds_path}'")
         self.sudo(f"chmod 600 {creds_path}")
-        self.sudo(
-            f"certbot certonly --dns-cloudflare "
-            f"--dns-cloudflare-credentials {creds_path} "
-            f"--dns-cloudflare-propagation-seconds 60 "
-            f"--non-interactive --agree-tos --email {email} "
-            f"-d {hostname} --keep-until-expiring"
-        )
+
+        try:
+            self.sudo(
+                f"certbot certonly --dns-cloudflare "
+                f"--dns-cloudflare-credentials {creds_path} "
+                f"--dns-cloudflare-propagation-seconds 120 "
+                f"--non-interactive --agree-tos --email {email} "
+                f"-d {hostname} --keep-until-expiring"
+            )
+        except RuntimeError as exc:
+            _, log, _ = self.sudo("tail -80 /var/log/letsencrypt/letsencrypt.log", check=False)
+            raise RuntimeError(
+                f"certbot DNS-01 failed for {hostname}: {exc}\n"
+                f"--- Last 80 lines of /var/log/letsencrypt/letsencrypt.log ---\n{log}"
+            )
 
     def install_dms(self, root_domain: str, le_email: str, cf_api_token: str) -> None:
         workdir = self._workdir()
