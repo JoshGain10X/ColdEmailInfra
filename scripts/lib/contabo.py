@@ -202,4 +202,6 @@ class ContaboClient:
         )
 
     def destroy_instance(self, instance_id: int) -> None:
-        self._request("DELETE", f"/compute/instances/{instance_id}")
+        # Contabo rejects DELETE with empty body + application/json content-type
+        # ("Body cannot be empty"); send {} to satisfy the validator.
+        self._request("DELETE", f"/compute/instances/{instance_id}", json={})

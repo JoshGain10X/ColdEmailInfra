@@ -182,12 +182,15 @@ class CloudflareClient:
 
     def delete_redirect_rules(self, zone_id: str, source_domain: str) -> int:
         """Remove redirect rules whose description was created by ensure_redirect_rule
-        for `source_domain`. Returns count of rules removed."""
+        for `source_domain`. Returns count of rules removed. Tolerates 403 (token
+        lacks Rulesets permission — matches deploy's non-fatal redirect handling)
+        and 404 (no ruleset exists)."""
         phase = "http_request_dynamic_redirect"
         try:
             body = self._request("GET", f"/zones/{zone_id}/rulesets/phases/{phase}/entrypoint")
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 404:
+        except RuntimeError as exc:
+            msg = str(exc)
+            if " 404 " in msg or " 403 " in msg:
                 return 0
             raise
         ruleset = body.get("result") or {}
