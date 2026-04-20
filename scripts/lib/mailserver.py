@@ -93,10 +93,25 @@ class MailserverClient:
         # Install Docker if not present. get.docker.com detects sudo automatically.
         self.run("command -v docker >/dev/null || (curl -fsSL https://get.docker.com | sudo -n sh)")
         self.sudo("systemctl enable --now docker")
+        # Also install certbot for Let's Encrypt cert acquisition.
+        self.sudo("apt-get update -qq", check=False)
+        self.sudo("apt-get install -y certbot")
         # Add the login user to the docker group so subsequent docker commands
         # don't need sudo. Takes effect on new sessions, so we still use sudo
         # for docker commands in this session.
         self.sudo(f"usermod -aG docker {self.user}", check=False)
+
+    def acquire_letsencrypt_cert(self, hostname: str, email: str) -> None:
+        """Acquire a Let's Encrypt cert for `hostname` via HTTP-01 on port 80.
+
+        Idempotent: if the cert already exists and is valid, certbot is a no-op.
+        Port 80 must be free on the VPS (it is on a fresh Contabo image).
+        DNS A record for `hostname` must already point at this VPS.
+        """
+        self.sudo(
+            f"certbot certonly --standalone --non-interactive --agree-tos "
+            f"--email {email} -d {hostname} --keep-until-expiring"
+        )
 
     def install_dms(self, root_domain: str, le_email: str) -> None:
         workdir = self._workdir()
@@ -115,6 +130,13 @@ class MailserverClient:
         env = (DMS_TEMPLATE_DIR / "mailserver.env").read_text()
         env = env.replace("__MAIL_HOSTNAME__", f"mail.{root_domain}")
         self.upload_text(env, f"{workdir}/mailserver.env")
+
+        # Stop any existing (possibly crash-looping) container before reconfiguring.
+        self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
+
+        # Acquire Let's Encrypt cert BEFORE starting the container so port 80 is
+        # free for HTTP-01 challenge and SSL_TYPE=letsencrypt has certs on disk.
+        self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email)
 
         self.sudo(f"sh -c 'cd {workdir} && docker compose pull'")
         self.sudo(f"sh -c 'cd {workdir} && docker compose up -d'")

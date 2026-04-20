@@ -225,8 +225,6 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
 
 
 def _step_install_mailserver(state: ShardState, domain: str) -> None:
-    if state.is_step_done("install_mailserver"):
-        return
     click.echo("[5/10] Installing docker-mailserver on VPS")
     vps = state.get("vps")
     le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
@@ -235,6 +233,18 @@ def _step_install_mailserver(state: ShardState, domain: str) -> None:
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
+        # Self-healing: if the step is already marked done and the container
+        # is actually healthy, skip. Otherwise re-run install to fix whatever
+        # broke (missing LE cert, bad config, crash loop).
+        if state.is_step_done("install_mailserver"):
+            _, out, _ = ms.sudo(
+                "docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' mailserver",
+                check=False,
+            )
+            if out.strip().endswith(" healthy"):
+                click.echo("  mailserver container already healthy, skipping reinstall")
+                return
+            click.echo("  mailserver container is not healthy — re-running install to fix")
         ms.install_docker()
         ms.install_dms(domain, le_email)
     finally:
