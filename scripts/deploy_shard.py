@@ -167,21 +167,41 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
     cb = ContaboClient()
     vps = state.get("vps")
     hostname = _mail_hostname(domain)
+    rev = dns.reversename.from_address(vps["ip"])
+
+    # Check current PTR first — maybe already correct from a previous run.
+    try:
+        current = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
+        click.echo(f"  Current PTR for {vps['ip']}: {current}")
+        if current == hostname:
+            click.echo("  PTR already correct, skipping update")
+            state.mark_step_done("set_ptr")
+            return
+    except Exception:
+        click.echo(f"  Current PTR for {vps['ip']}: (no resolution yet)")
+
+    click.echo(f"  Setting PTR to {hostname} via Contabo API")
     cb.set_ptr(vps["id"], hostname)
 
-    deadline = time.time() + 600
+    deadline = time.time() + 1800  # 30 min — Contabo rDNS for fresh IPs can be slow
+    last_current = ""
     while time.time() < deadline:
         try:
-            rev = dns.reversename.from_address(vps["ip"])
-            answers = dns.resolver.resolve(rev, "PTR")
-            resolved = str(answers[0]).rstrip(".")
-            if resolved == hostname:
+            last_current = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
+            if last_current == hostname:
                 state.mark_step_done("set_ptr")
                 return
         except Exception:
             pass
-        time.sleep(20)
-    raise click.ClickException("PTR did not propagate within 10 minutes")
+        time.sleep(30)
+    raise click.ClickException(
+        f"PTR did not propagate to {hostname} within 30 min "
+        f"(currently resolves to: {last_current or '(nothing)'}).\n"
+        f"Contabo's rDNS can take longer for fresh IPs. Verify manually:\n"
+        f"  dig +short -x {vps['ip']}\n"
+        f"If it shows the right hostname, re-run this command — step 3 will fast-path. "
+        f"Otherwise wait 30-60 min and retry."
+    )
 
 
 def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
