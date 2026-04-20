@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib import blocklist
 from lib.bison import export as bison_export
 from lib.cloudflare import CloudflareClient
 from lib.contabo import ContaboClient
@@ -107,55 +108,88 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
     public_key = ssh_pub_path.read_text().strip()
     ssh_key_id = cb.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
 
-    # 1) Check state for an instance ID we already acquired on a prior run
+    # Seed instance_id from state or orphan lookup
     vps_state = state.get("vps") or {}
     instance_id = vps_state.get("id")
-
-    # 2) If not, look for an orphan instance with the same display name
     if not instance_id:
         existing = cb.find_instance_by_display_name(display_name)
         if existing:
             instance_id = existing.get("instanceId") or existing.get("id")
             click.echo(f"  Found existing Contabo instance {instance_id} (displayName '{display_name}'), reusing")
 
-    # 3) Otherwise create a fresh one
-    if not instance_id:
-        try:
-            inst = cb.create_instance(
-                display_name=display_name,
-                product_id=product_id,
-                region=region,
-                ssh_key_id=ssh_key_id,
-                image_id=image_id,
-            )
-        except requests.HTTPError as exc:
-            body = exc.response.text if exc.response is not None else str(exc)
-            if "not available" in body.lower() or "productid" in body.lower():
-                raise click.ClickException(
-                    f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
-                    f"Contabo does not expose a list-products API — pick a current productId from\n"
-                    f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
-                    f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
+    blocked_ips_tried: list[dict] = state.get("blocked_ips_tried") or []
+    max_attempts = 3
+    ip: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        # Create a fresh instance if we don't have one yet (first iteration,
+        # or we destroyed the previous one because its IP was blocklisted)
+        if not instance_id:
+            try:
+                inst = cb.create_instance(
+                    display_name=display_name,
+                    product_id=product_id,
+                    region=region,
+                    ssh_key_id=ssh_key_id,
+                    image_id=image_id,
                 )
-            raise
-        instance_id = inst.get("instanceId") or inst.get("id")
+            except requests.HTTPError as exc:
+                body = exc.response.text if exc.response is not None else str(exc)
+                if "not available" in body.lower() or "productid" in body.lower():
+                    raise click.ClickException(
+                        f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
+                        f"Contabo does not expose a list-products API — pick a current productId from\n"
+                        f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
+                        f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
+                    )
+                raise
+            instance_id = inst.get("instanceId") or inst.get("id")
 
-    # Save the instance ID immediately so future re-runs can recover even if the next step fails
-    state.set("vps", {
-        "id": instance_id,
-        "ip": vps_state.get("ip"),
-        "product_id": product_id,
-        "region": region,
-    })
+        # Save state immediately so a crash mid-wait doesn't lose track of the instance
+        state.set("vps", {
+            "id": instance_id,
+            "ip": None,
+            "product_id": product_id,
+            "region": region,
+        })
 
-    inst = cb.wait_for_instance_ready(instance_id)
-    ip = ((inst.get("ipConfig") or {}).get("v4") or {}).get("ip")
+        inst = cb.wait_for_instance_ready(instance_id)
+        ip = ((inst.get("ipConfig") or {}).get("v4") or {}).get("ip")
+
+        # Blocklist gate — Spamhaus Zen, Barracuda, SpamCop
+        listed = blocklist.check_ip(ip)
+        if not listed:
+            break
+
+        # Dirty IP: record, destroy, and loop to reprovision
+        click.echo(f"  IP {ip} listed on {', '.join(listed)} — destroying and retrying ({attempt}/{max_attempts})")
+        blocked_ips_tried.append({"ip": ip, "listed_on": listed})
+        state.set("blocked_ips_tried", blocked_ips_tried)
+        try:
+            cb.destroy_instance(instance_id)
+        except Exception as exc:
+            click.echo(f"  warning: destroy failed for {instance_id}: {exc}")
+        instance_id = None
+        ip = None
+    else:
+        # Loop exited without break = all attempts blocklisted
+        summary = "\n".join(
+            f"  - {t['ip']} ({', '.join(t['listed_on'])})" for t in blocked_ips_tried
+        )
+        raise click.ClickException(
+            f"All {max_attempts} provisioned Contabo IPs were on a DNSBL:\n{summary}\n"
+            f"Contabo's IP pool may be hot right now; try a different region or retry later."
+        )
+
+    # Clean IP obtained; persist final state
     state.set("vps", {
         "id": instance_id,
         "ip": ip,
         "product_id": product_id,
         "region": region,
     })
+    if blocked_ips_tried:
+        click.echo(f"  Clean IP {ip} obtained after {len(blocked_ips_tried)} blocklisted retries")
     cb.wait_for_ssh(ip)
     state.mark_step_done("provision_vps")
 
