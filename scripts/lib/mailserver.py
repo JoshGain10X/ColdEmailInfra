@@ -38,6 +38,12 @@ class MailserverClient:
                     key_filename=str(self.ssh_key_path),
                     timeout=15,
                 )
+                # Keepalive every 60s so idle SSH channels (e.g. during
+                # certbot's 600s DNS propagation wait) don't get dropped by
+                # NAT / CGNAT middleboxes. Without this, recv_exit_status()
+                # hangs forever when the server-side command finishes but the
+                # TCP half is already dead.
+                client.get_transport().set_keepalive(60)
                 self.ssh = client
                 return
             except (paramiko.SSHException, OSError) as exc:
