@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Load a shard's mailboxes into a Bison workspace as IMAP/SMTP senders.
 
-Reads shards/<domain>_bison.csv (produced by deploy_shard.py step 8),
-discovers available workspaces from BISON_API_TOKENS (comma-separated
-per-workspace tokens in .env), lets the user pick one, then creates
-each sender via POST /api/sender-emails/imap-smtp and tags every
-sender with "Custom SMTP" (or --tag).
-
-Idempotent: re-running against the same CSV + workspace skips any
-senders whose email already exists. The tag is still re-applied to
-existing senders so they pick it up on re-runs.
+Bison's sender-create endpoint (POST /api/sender-emails/imap-smtp)
+intermittently 500s when preceded by other API traffic from the same
+process/IP. Everything in this script that happens *before* the first
+create is therefore either a curl subprocess (cold TCP, no Python
+state carried over) or gated behind a cool-off pause. Tag resolution
+is deferred until after all creates so it never sits on the critical
+path.
 """
 from __future__ import annotations
 
@@ -24,15 +22,45 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.bison_api import BisonClient  # noqa: E402
-
 
 SHARDS_DIR = Path(__file__).resolve().parents[1] / "shards"
+_CURL_SENTINEL = "<<<BISON_HTTP_CODE>>>"
 
 
-def _discover_workspaces(tokens: list[str]) -> list[tuple[str, dict]]:
-    """Probe each token, return [(token, workspace_dict)] for usable entries.
+def _curl(method: str, base_url: str, path: str, token: str, body: dict | None = None) -> tuple[int, dict]:
+    """Shell out to curl for a Bison API call. Returns (status_code, body_dict)."""
+    cmd = [
+        "curl", "-s",
+        "-X", method, f"{base_url}{path}",
+        "-H", f"Authorization: Bearer {token}",
+        "-H", "Accept: application/json",
+        "-w", f"\n{_CURL_SENTINEL}%{{http_code}}",
+    ]
+    if body is not None:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return 0, {"error": "curl timed out after 60s"}
+
+    output = result.stdout or ""
+    if _CURL_SENTINEL not in output:
+        return 0, {"error": f"curl produced no sentinel; raw={output[:400]} stderr={result.stderr[:200]}"}
+    body_str, code_str = output.rsplit(_CURL_SENTINEL, 1)
+    try:
+        status = int(code_str.strip())
+    except ValueError:
+        status = 0
+    body_str = body_str.strip()
+    try:
+        parsed = json.loads(body_str) if body_str else {}
+    except json.JSONDecodeError:
+        parsed = {"raw": body_str[:500]}
+    return status, parsed
+
+
+def _discover_workspaces(base_url: str, tokens: list[str]) -> list[tuple[str, dict]]:
+    """Via curl, probe each token and return [(token, workspace_dict)] for usable entries.
 
     Skips tokens that error out or return >1 workspace (super-admin tokens
     can't target a specific workspace for writes, so they aren't usable
@@ -40,12 +68,11 @@ def _discover_workspaces(tokens: list[str]) -> list[tuple[str, dict]]:
     """
     usable: list[tuple[str, dict]] = []
     for idx, token in enumerate(tokens, 1):
-        client = BisonClient(token)
-        try:
-            workspaces = client.get_workspaces()
-        except Exception as exc:
-            click.echo(f"  Token {idx}: ERROR — {exc}")
+        status, body = _curl("GET", base_url, "/api/workspaces/v1.1", token)
+        if status != 200:
+            click.echo(f"  Token {idx}: HTTP {status} — {json.dumps(body)[:200]}")
             continue
+        workspaces = body.get("data") or []
         if not workspaces:
             click.echo(f"  Token {idx}: returned no workspaces, skipping")
             continue
@@ -62,14 +89,60 @@ def _discover_workspaces(tokens: list[str]) -> list[tuple[str, dict]]:
     return usable
 
 
+def _already_taken(body: dict) -> bool:
+    """Detect Bison's 'email already taken' 422 validation shape.
+
+    Bison nests the validation envelope under a `data` key:
+      {"data": {"success": false, "message": "The email has already...",
+                "errors": {"email": ["The email has already..."]}}}
+    Walk both top-level and nested `data` for robustness.
+    """
+    for candidate in (body, body.get("data") or {}):
+        if not isinstance(candidate, dict):
+            continue
+        msg = str(candidate.get("message", "")).lower()
+        errors = candidate.get("errors") or {}
+        email_errs = ""
+        if isinstance(errors, dict):
+            email_errs = " ".join(errors.get("email", []) or []).lower()
+        combined = f"{msg} {email_errs}"
+        if any(kw in combined for kw in ("already been taken", "already exists", "has been taken")):
+            return True
+    return False
+
+
+def _row_to_payload(row: dict) -> dict:
+    return {
+        "name": row.get("Name", "").strip(),
+        "email": row.get("Email", "").strip(),
+        "password": row.get("Password", ""),
+        "imap_server": row.get("IMAP Server", "").strip(),
+        "imap_port": int(row.get("IMAP Port", 993)),
+        "smtp_server": row.get("SMTP Server", "").strip(),
+        "smtp_port": int(row.get("SMTP Port", 465)),
+        "smtp_secure": str(row.get("SMTP Secure", "TRUE")).strip().upper() == "TRUE",
+        "imap_secure": str(row.get("IMAP Secure", "TRUE")).strip().upper() == "TRUE",
+    }
+
+
 @click.command()
 @click.option("--domain", required=True, help="Shard root domain (matches shards/<domain>_bison.csv).")
 @click.option("--workspace", default=None, help="Workspace name to target (skips interactive picker).")
 @click.option("--tag", default="Custom SMTP", show_default=True, help="Tag to attach to every imported sender.")
 @click.option("--csv-path", default=None, help="Override CSV path (default shards/<domain>_bison.csv).")
 @click.option("--yes", is_flag=True, help="Skip the 'about to create N senders' confirmation.")
-@click.option("--throttle", default=1.5, show_default=True, help="Seconds to sleep between sender creates (Bison's synchronous IMAP/SMTP validator 500s on back-to-back posts).")
-def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes: bool, throttle: float) -> None:
+@click.option("--throttle", default=1.5, show_default=True, help="Seconds between sender creates.")
+@click.option("--preflight", default=15.0, show_default=True,
+              help="Seconds to sleep after workspace discovery and before the first create. Bison's sender-create 500s when preceded by recent API traffic; a cool-off here is the most reliable mitigation.")
+def main(
+    domain: str,
+    workspace: str | None,
+    tag: str,
+    csv_path: str | None,
+    yes: bool,
+    throttle: float,
+    preflight: float,
+) -> None:
     load_dotenv()
 
     csv_file = Path(csv_path) if csv_path else SHARDS_DIR / f"{domain}_bison.csv"
@@ -83,9 +156,10 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
             "per-workspace Bison tokens."
         )
     tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
+    base_url = os.environ.get("BISON_API_BASE", "https://send.spamproofed.com").rstrip("/")
 
     click.echo("Discovering workspaces from BISON_API_TOKENS...")
-    usable = _discover_workspaces(tokens)
+    usable = _discover_workspaces(base_url, tokens)
     if not usable:
         raise click.ClickException("No usable per-workspace tokens in BISON_API_TOKENS.")
 
@@ -108,9 +182,7 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
         chosen_token, chosen_ws = usable[idx - 1]
 
     click.echo(f"\nTarget workspace: {chosen_ws.get('name')} (id={chosen_ws.get('id')})")
-    client = BisonClient(chosen_token)
 
-    # Load CSV
     with csv_file.open(newline="") as fh:
         rows = list(csv.DictReader(fh))
     click.echo(f"Loaded {len(rows)} senders from {csv_file.name}")
@@ -121,25 +193,15 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
             abort=True,
         )
 
-    # Find-or-create the tag (one GET + optional POST — no pagination,
-    # so doesn't trigger the 500-on-next-POST pattern we get from
-    # heavier pre-listing).
-    click.echo(f"Resolving tag {tag!r}...")
-    tag_record = client.find_or_create_tag(tag)
-    tag_id = tag_record.get("id")
-    if not tag_id:
-        raise click.ClickException(f"Could not resolve or create tag {tag!r}")
-    click.echo(f"  Tag id={tag_id}")
+    # Cool-off before first create. Nothing else between discovery and
+    # the loop — tag resolution is deferred to after creates so it
+    # doesn't sit on the critical path.
+    if preflight > 0:
+        click.echo(f"Waiting {preflight:.0f}s for Bison state to drain before first create...")
+        time.sleep(preflight)
 
-    # Create senders via curl subprocess. Identical POST through Python
-    # requests was reliably 500ing after any preceding API traffic,
-    # while curl works every time. Shelling out to curl is simpler and
-    # more robust than reverse-engineering why requests triggers Bison's
-    # bug. Duplicate detection is via Bison's 422 response rather than
-    # a pre-listing, so there are no poisoning GETs either.
-    base_url = os.environ.get("BISON_API_BASE", "https://send.spamproofed.com").rstrip("/")
     created_ids: list[int] = []
-    skipped_ids: list[int] = []
+    skipped: list[str] = []
     failed: list[tuple[str, str]] = []
 
     for i, row in enumerate(rows, 1):
@@ -147,19 +209,7 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
         if not email:
             click.echo(f"  [{i:3}/{len(rows)}] row missing Email, skipping")
             continue
-
-        payload = {
-            "name": row.get("Name", "").strip(),
-            "email": email,
-            "password": row.get("Password", ""),
-            "imap_server": row.get("IMAP Server", "").strip(),
-            "imap_port": int(row.get("IMAP Port", 993)),
-            "smtp_server": row.get("SMTP Server", "").strip(),
-            "smtp_port": int(row.get("SMTP Port", 465)),
-            "smtp_secure": str(row.get("SMTP Secure", "TRUE")).strip().upper() == "TRUE",
-            "imap_secure": str(row.get("IMAP Secure", "TRUE")).strip().upper() == "TRUE",
-        }
-        status, body = _curl_post_sender(base_url, chosen_token, payload)
+        status, body = _curl("POST", base_url, "/api/sender-emails/imap-smtp", chosen_token, body=_row_to_payload(row))
 
         if status == 201:
             sid = (body.get("data") or {}).get("id")
@@ -167,9 +217,8 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
                 created_ids.append(sid)
             click.echo(f"  [{i:3}/{len(rows)}] {email} — created (id={sid})")
         elif status == 422 and _already_taken(body):
+            skipped.append(email)
             click.echo(f"  [{i:3}/{len(rows)}] {email} — already exists, skipping")
-            # Can't tag without an id; skip tagging for pre-existing senders.
-            # A re-run after all creates is cheap if you need full coverage.
         else:
             err = f"HTTP {status}: {json.dumps(body)[:300]}"
             failed.append((email, err))
@@ -178,21 +227,27 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
         if throttle > 0:
             time.sleep(throttle)
 
-    # Attach tag to the newly-created senders. Pre-existing senders
-    # don't get re-tagged since we don't pay the cost of looking their
-    # IDs up — if you need a fully-tagged workspace, destroy/redeploy
-    # the shard and re-run so every sender gets a fresh create.
+    # Resolve tag now (after creates, not before, so the tag GET/POST
+    # doesn't sit on the critical path for the first create).
     if created_ids:
-        click.echo(f"\nAttaching tag {tag!r} to {len(created_ids)} new senders...")
-        try:
-            client.attach_tag_to_senders(tag_id, created_ids)
-            click.echo("  Done.")
-        except Exception as exc:
-            click.echo(f"  Tag attach FAILED: {exc}")
+        click.echo(f"\nResolving tag {tag!r}...")
+        tag_id = _resolve_tag(base_url, chosen_token, tag)
+        if tag_id is None:
+            click.echo(f"  Tag resolve FAILED — skipping tag attach")
+        else:
+            click.echo(f"  Tag id={tag_id}. Attaching to {len(created_ids)} new senders...")
+            status, body = _curl(
+                "POST", base_url, "/api/tags/attach-to-sender-emails", chosen_token,
+                body={"tag_ids": [tag_id], "sender_email_ids": created_ids, "skip_webhooks": True},
+            )
+            if status == 200:
+                click.echo("  Done.")
+            else:
+                click.echo(f"  Tag attach FAILED: HTTP {status}: {json.dumps(body)[:200]}")
 
     click.echo(
         f"\nSummary: {len(created_ids)} created, "
-        f"{len(skipped_ids)} already existed, {len(failed)} failed"
+        f"{len(skipped)} already existed, {len(failed)} failed"
     )
     if failed:
         click.echo("Failures:")
@@ -201,71 +256,17 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
         sys.exit(1)
 
 
-_CURL_SENTINEL = "<<<BISON_HTTP_CODE>>>"
-
-
-def _curl_post_sender(base_url: str, token: str, payload: dict) -> tuple[int, dict]:
-    """Create a sender via curl subprocess. Returns (status_code, body_dict).
-
-    Shelling out to curl because Python requests was reliably 500ing on
-    Bison's sender-create endpoint (curl with an identical payload always
-    succeeded, same token, same host, same minute). Root cause unknown
-    inside Bison; swapping the client is faster than chasing it further.
-    """
-    body_json = json.dumps(payload)
-    try:
-        result = subprocess.run(
-            [
-                "curl", "-s",
-                "-X", "POST", f"{base_url}/api/sender-emails/imap-smtp",
-                "-H", f"Authorization: Bearer {token}",
-                "-H", "Content-Type: application/json",
-                "-H", "Accept: application/json",
-                "-d", body_json,
-                "-w", f"\n{_CURL_SENTINEL}%{{http_code}}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return 0, {"error": "curl timed out after 60s"}
-    output = result.stdout or ""
-    if _CURL_SENTINEL not in output:
-        return 0, {"error": f"curl produced no sentinel; raw={output[:500]} stderr={result.stderr[:200]}"}
-    body_str, code_str = output.rsplit(_CURL_SENTINEL, 1)
-    try:
-        status = int(code_str.strip())
-    except ValueError:
-        status = 0
-    body_str = body_str.strip()
-    try:
-        body = json.loads(body_str) if body_str else {}
-    except json.JSONDecodeError:
-        body = {"raw": body_str[:500]}
-    return status, body
-
-
-def _already_taken(body: dict) -> bool:
-    """Detect Bison's 'email already taken' validation error shape.
-
-    Bison wraps 422 validation errors under a `data` envelope:
-      {"data": {"success": false, "message": "The email has already...",
-                "errors": {"email": ["The email has already..."]}}}
-    Check both top level and nested `data` for robustness.
-    """
-    for candidate in (body, body.get("data") or {}):
-        if not isinstance(candidate, dict):
-            continue
-        msg = str(candidate.get("message", "")).lower()
-        errors = candidate.get("errors") or {}
-        email_errs = ""
-        if isinstance(errors, dict):
-            email_errs = " ".join(errors.get("email", []) or []).lower()
-        combined = f"{msg} {email_errs}"
-        if any(kw in combined for kw in ("already been taken", "already exists", "has been taken")):
-            return True
-    return False
+def _resolve_tag(base_url: str, token: str, name: str) -> int | None:
+    """Find an existing tag by name, or create it. Returns tag_id or None on error."""
+    status, body = _curl("GET", base_url, "/api/tags", token)
+    if status == 200:
+        for tag in body.get("data") or []:
+            if tag.get("name") == name:
+                return tag.get("id")
+    status, body = _curl("POST", base_url, "/api/tags", token, body={"name": name})
+    if status in (200, 201):
+        return (body.get("data") or {}).get("id")
+    return None
 
 
 if __name__ == "__main__":
