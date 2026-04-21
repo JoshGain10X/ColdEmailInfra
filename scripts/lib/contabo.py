@@ -127,11 +127,23 @@ class ContaboClient:
         return body["data"][0]
 
     def find_instance_by_display_name(self, display_name: str) -> dict | None:
-        """Return the first instance matching the given display name, or None."""
+        """Return the first ACTIVE (non-cancelled) instance matching the given
+        display name, or None.
+
+        Contabo's /cancel endpoint only schedules termination at end of billing
+        period — cancelled VPSes stay in the list endpoint until then. We must
+        skip them, otherwise a destroy-then-redeploy cycle silently lands back
+        on the same (potentially blocklisted) IP. Check both `cancelDate` and
+        `cancellationDate` since Contabo's docs have used either spelling
+        across API versions.
+        """
         body = self._request("GET", "/compute/instances", params={"size": 100})
         for inst in body.get("data", []):
-            if inst.get("displayName") == display_name:
-                return inst
+            if inst.get("displayName") != display_name:
+                continue
+            if inst.get("cancelDate") or inst.get("cancellationDate"):
+                continue
+            return inst
         return None
 
     def wait_for_instance_ready(self, instance_id: int, timeout: int = 900) -> dict:
