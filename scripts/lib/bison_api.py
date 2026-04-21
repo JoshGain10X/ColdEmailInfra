@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import requests
@@ -30,21 +31,44 @@ class BisonClient:
             "Accept": "application/json",
         }
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        resp = self.session.request(
-            method,
-            f"{self.base_url}{path}",
-            headers={**self._headers(), **kwargs.pop("headers", {})},
-            timeout=60,
-            **kwargs,
-        )
-        if resp.status_code >= 400:
-            raise requests.HTTPError(
-                f"{resp.status_code} {resp.text}", response=resp
+    def _request(
+        self,
+        method: str,
+        path: str,
+        retries: int = 3,
+        backoff: float = 2.0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Issue a request, retrying on 5xx with exponential backoff.
+
+        Bison's sender-create endpoint does synchronous IMAP/SMTP validation
+        and intermittently returns 500 "Server Error" when its internal
+        validator times out on rapid consecutive calls. One retry after a
+        short pause almost always recovers; default of 3 is defensive.
+        """
+        last_exc: requests.HTTPError | None = None
+        for attempt in range(1, retries + 1):
+            resp = self.session.request(
+                method,
+                f"{self.base_url}{path}",
+                headers={**self._headers(), **kwargs.pop("headers", {})},
+                timeout=60,
+                **kwargs,
             )
-        if not resp.content:
-            return {}
-        return resp.json()
+            if resp.status_code >= 500 and attempt < retries:
+                time.sleep(backoff * attempt)
+                continue
+            if resp.status_code >= 400:
+                last_exc = requests.HTTPError(
+                    f"{resp.status_code} {resp.text}", response=resp
+                )
+                raise last_exc
+            if not resp.content:
+                return {}
+            return resp.json()
+        if last_exc is not None:
+            raise last_exc
+        return {}
 
     # ------------------------------------------------------------------
     # Workspaces

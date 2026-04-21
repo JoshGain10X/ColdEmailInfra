@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -65,7 +66,8 @@ def _discover_workspaces(tokens: list[str]) -> list[tuple[str, dict]]:
 @click.option("--tag", default="Custom SMTP", show_default=True, help="Tag to attach to every imported sender.")
 @click.option("--csv-path", default=None, help="Override CSV path (default shards/<domain>_bison.csv).")
 @click.option("--yes", is_flag=True, help="Skip the 'about to create N senders' confirmation.")
-def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes: bool) -> None:
+@click.option("--throttle", default=1.5, show_default=True, help="Seconds to sleep between sender creates (Bison's synchronous IMAP/SMTP validator 500s on back-to-back posts).")
+def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes: bool, throttle: float) -> None:
     load_dotenv()
 
     csv_file = Path(csv_path) if csv_path else SHARDS_DIR / f"{domain}_bison.csv"
@@ -169,6 +171,8 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
         except Exception as exc:
             failed.append((email, str(exc)))
             click.echo(f"  [{i:3}/{len(rows)}] {email} — FAILED: {exc}")
+        if throttle > 0:
+            time.sleep(throttle)
 
     # Attach tag to both newly created and already-existing senders, so
     # re-runs converge on a fully-tagged workspace.
