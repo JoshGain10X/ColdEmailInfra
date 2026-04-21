@@ -247,12 +247,25 @@ def _curl_post_sender(base_url: str, token: str, payload: dict) -> tuple[int, di
 
 
 def _already_taken(body: dict) -> bool:
-    """Detect Bison's 'email already taken' validation error shape."""
-    msg = str(body.get("message", "")).lower()
-    errors = body.get("errors") or {}
-    email_errs = " ".join(errors.get("email", [])).lower() if isinstance(errors, dict) else ""
-    combined = f"{msg} {email_errs}"
-    return any(kw in combined for kw in ("already been taken", "already exists", "has been taken"))
+    """Detect Bison's 'email already taken' validation error shape.
+
+    Bison wraps 422 validation errors under a `data` envelope:
+      {"data": {"success": false, "message": "The email has already...",
+                "errors": {"email": ["The email has already..."]}}}
+    Check both top level and nested `data` for robustness.
+    """
+    for candidate in (body, body.get("data") or {}):
+        if not isinstance(candidate, dict):
+            continue
+        msg = str(candidate.get("message", "")).lower()
+        errors = candidate.get("errors") or {}
+        email_errs = ""
+        if isinstance(errors, dict):
+            email_errs = " ".join(errors.get("email", []) or []).lower()
+        combined = f"{msg} {email_errs}"
+        if any(kw in combined for kw in ("already been taken", "already exists", "has been taken")):
+            return True
+    return False
 
 
 if __name__ == "__main__":
