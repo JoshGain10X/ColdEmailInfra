@@ -131,19 +131,26 @@ class ContaboClient:
         display name, or None.
 
         Contabo's /cancel endpoint only schedules termination at end of billing
-        period — cancelled VPSes stay in the list endpoint until then. We must
-        skip them, otherwise a destroy-then-redeploy cycle silently lands back
-        on the same (potentially blocklisted) IP. Check both `cancelDate` and
-        `cancellationDate` since Contabo's docs have used either spelling
-        across API versions.
+        period — cancelled VPSes stay visible from the list endpoint until
+        then. We must skip them, otherwise a destroy-then-redeploy cycle
+        silently lands back on the same (potentially blocklisted) IP.
+
+        The list endpoint (/compute/instances) omits `cancelDate` from its
+        response; only the detail endpoint (/compute/instances/{id}) includes
+        it. So when we match a displayName, fetch the full detail record to
+        check cancellation status.
         """
         body = self._request("GET", "/compute/instances", params={"size": 100})
         for inst in body.get("data", []):
             if inst.get("displayName") != display_name:
                 continue
-            if inst.get("cancelDate") or inst.get("cancellationDate"):
+            instance_id = inst.get("instanceId") or inst.get("id")
+            if instance_id is None:
                 continue
-            return inst
+            detail = self.get_instance(instance_id)
+            if detail.get("cancelDate") or detail.get("cancellationDate"):
+                continue
+            return detail
         return None
 
     def wait_for_instance_ready(self, instance_id: int, timeout: int = 900) -> dict:
