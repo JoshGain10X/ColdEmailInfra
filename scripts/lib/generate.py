@@ -8,7 +8,13 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
-SUBDOMAINS_PER_SHARD = 20
+SUBDOMAINS = [
+    "hello", "hi", "contact", "mail", "email",
+    "team", "hey", "talk", "chat", "connect",
+    "reach", "inbox", "support", "info", "message",
+    "ping", "meet", "intro", "new", "join",
+]
+SUBDOMAINS_PER_SHARD = len(SUBDOMAINS)
 MAILBOXES_PER_SUBDOMAIN = 5
 MAILBOXES_PER_SHARD = SUBDOMAINS_PER_SHARD * MAILBOXES_PER_SUBDOMAIN
 
@@ -22,10 +28,8 @@ def _domain_seed(domain: str) -> int:
 
 
 def pick_subdomains(domain: str, seed: int | None = None) -> list[str]:
-    """Return SUBDOMAINS_PER_SHARD subdomain words (labels only, no FQDN)."""
-    words = _load_lines("subdomain_words.txt")
-    rng = random.Random(seed if seed is not None else _domain_seed(domain))
-    return rng.sample(words, SUBDOMAINS_PER_SHARD)
+    """Return the fixed 20-subdomain set used on every shard."""
+    return list(SUBDOMAINS)
 
 
 def generate_mailboxes(root_domain: str, subdomain_labels: list[str], seed: int | None = None) -> list[dict]:
