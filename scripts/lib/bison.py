@@ -37,6 +37,6 @@ def export(mailboxes: list[dict], mail_hostname: str, out_path: Path, daily_limi
                 mail_hostname,
                 465,
                 daily_limit,
-                "SSL",
-                "SSL",
+                "TRUE",
+                "TRUE",
             ])
