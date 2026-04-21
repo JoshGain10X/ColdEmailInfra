@@ -22,13 +22,19 @@ class BisonClient:
         self.base_url = (base_url or os.environ.get(
             "BISON_API_BASE", "https://send.spamproofed.com"
         )).rstrip("/")
-        self.session = requests.Session()
 
     def _headers(self) -> dict[str, str]:
+        # User-Agent explicitly mimics curl: Bison's sender-create endpoint
+        # was reliably 500ing on python-requests while identical curl calls
+        # succeeded. Keeping UA, Connection: close, and fresh TCP per
+        # request (no Session) brings behaviour in line with curl.
         return {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "curl/8.6.0",
+            "Connection": "close",
+            "Expect": "",
         }
 
     def _request(
@@ -41,14 +47,13 @@ class BisonClient:
     ) -> dict[str, Any]:
         """Issue a request, retrying on 5xx with exponential backoff.
 
-        Bison's sender-create endpoint does synchronous IMAP/SMTP validation
-        and intermittently returns 500 "Server Error" when its internal
-        validator times out on rapid consecutive calls. One retry after a
-        short pause almost always recovers; default of 3 is defensive.
+        No requests.Session: every call opens a fresh TCP/TLS connection,
+        matching curl's behaviour. Pooled keep-alive triggered server-side
+        500s on Bison's sender-create endpoint.
         """
         last_exc: requests.HTTPError | None = None
         for attempt in range(1, retries + 1):
-            resp = self.session.request(
+            resp = requests.request(
                 method,
                 f"{self.base_url}{path}",
                 headers={**self._headers(), **kwargs.pop("headers", {})},
