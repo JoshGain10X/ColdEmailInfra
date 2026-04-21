@@ -221,11 +221,45 @@ class ContaboClient:
         )
 
     def destroy_instance(self, instance_id: int) -> None:
-        """Cancel a Contabo instance. Billing stops at the end of the current
-        billing period; the instance remains listed until then.
+        """Cancel a Contabo instance and free up its displayName.
 
-        Endpoint: POST /v1/compute/instances/{instanceId}/cancel
-        (DELETE was deprecated — it now returns Express-style 404
-        "Cannot DELETE /v1/...". The /cancel POST is the current path.)
+        Contabo's /cancel endpoint schedules termination at end of the
+        billing period; the VPS stays listed (and holds its displayName)
+        until then. That collides with redeploying the same shard, since
+        Contabo enforces displayName uniqueness even across cancelled
+        instances. So we rename the VPS to '<name>-cancelled-<ts>' before
+        calling /cancel — that frees the original displayName for the
+        next deploy.
+
+        A 422 'already been canceled' from /cancel is treated as a
+        successful no-op (prior destroy already took).
+
+        Endpoints:
+          PATCH /v1/compute/instances/{id}      body: {"displayName": "..."}
+          POST  /v1/compute/instances/{id}/cancel
         """
-        self._request("POST", f"/compute/instances/{instance_id}/cancel", json={})
+        # Rename first so the displayName is freed regardless of whether
+        # the subsequent cancel is a fresh call or a no-op (instance was
+        # already cancelled by a previous destroy).
+        try:
+            current = self.get_instance(instance_id)
+            current_name = current.get("displayName") or f"instance-{instance_id}"
+            if "-cancelled-" not in current_name:
+                timestamp = time.strftime("%Y%m%dT%H%M%S")
+                self._request(
+                    "PATCH",
+                    f"/compute/instances/{instance_id}",
+                    json={"displayName": f"{current_name}-cancelled-{timestamp}"},
+                )
+        except Exception:
+            # Don't block cancellation if the rename fails — user can
+            # rename manually in the Contabo dashboard as a fallback.
+            pass
+
+        try:
+            self._request("POST", f"/compute/instances/{instance_id}/cancel", json={})
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None and resp.status_code == 422 and "already" in resp.text.lower():
+                return
+            raise
