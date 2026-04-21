@@ -119,11 +119,18 @@ def main(domain: str, workspace: str | None, tag: str, csv_path: str | None, yes
             abort=True,
         )
 
-    # Existing senders in this workspace — used to skip duplicates.
-    click.echo("Fetching existing senders in workspace...")
-    existing = client.list_sender_emails()
+    # Existing senders in this workspace — scoped to our shard's root
+    # domain so we don't fire 60+ rapid pagination GETs on workspaces
+    # with thousands of unrelated senders (that reliably triggers 500s
+    # on the first subsequent create POST).
+    click.echo(f"Fetching existing senders matching {domain!r}...")
+    existing = client.list_sender_emails(search=domain)
     existing_by_email = {s["email"]: s for s in existing if s.get("email")}
-    click.echo(f"  {len(existing)} senders already in workspace")
+    click.echo(f"  {len(existing)} matching senders already in workspace")
+
+    # Small cool-off so any residual rate-limit state from the listing
+    # has cleared before the first synchronous IMAP/SMTP-validating POST.
+    time.sleep(5)
 
     # Find-or-create the tag.
     click.echo(f"Resolving tag {tag!r}...")

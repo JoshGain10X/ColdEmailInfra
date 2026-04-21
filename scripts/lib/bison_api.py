@@ -92,18 +92,31 @@ class BisonClient:
     # Sender emails (IMAP/SMTP email accounts)
     # ------------------------------------------------------------------
 
-    def list_sender_emails(self) -> list[dict]:
-        """Return every sender email in the current workspace.
+    def list_sender_emails(
+        self,
+        search: str | None = None,
+        page_delay: float = 0.3,
+    ) -> list[dict]:
+        """Return sender emails in the current workspace.
+
+        Pass `search` to scope to a substring (e.g. the shard's domain)
+        — critical on workspaces with thousands of unrelated senders,
+        where unscoped pagination triggers 500s on subsequent writes.
 
         Bison paginates at 15/page by default; we request 100/page and
-        walk `meta.last_page` so callers get the full set.
+        walk `meta.last_page`. A small `page_delay` between fetches
+        keeps rapid listing from poisoning Bison's internal rate limiter
+        or IMAP validator state, which reliably causes the first
+        subsequent POST to fail 500.
         """
         all_items: list[dict] = []
         page = 1
         while True:
-            body = self._request(
-                "GET", f"/api/sender-emails?page={page}&per_page=100"
-            )
+            params = [f"page={page}", "per_page=100"]
+            if search:
+                params.append(f"search={search}")
+            query = "&".join(params)
+            body = self._request("GET", f"/api/sender-emails?{query}")
             all_items.extend(body.get("data", []))
             meta = body.get("meta") or {}
             last = meta.get("last_page", page)
@@ -111,6 +124,8 @@ class BisonClient:
             if current >= last:
                 break
             page += 1
+            if page_delay > 0:
+                time.sleep(page_delay)
         return all_items
 
     def create_sender_imap_smtp(self, payload: dict) -> dict:
