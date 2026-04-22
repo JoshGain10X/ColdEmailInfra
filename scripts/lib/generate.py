@@ -18,6 +18,13 @@ SUBDOMAINS_PER_SHARD = len(SUBDOMAINS)
 MAILBOXES_PER_SUBDOMAIN = 5
 MAILBOXES_PER_SHARD = SUBDOMAINS_PER_SHARD * MAILBOXES_PER_SUBDOMAIN
 
+# Fixed password for every mailbox on every shard. The security tradeoff is
+# deliberate: these mailboxes only exist for cold-email warmup/sending and
+# a shared password makes manual login, CSV spot-checks, and tool imports
+# much simpler. If it ever leaks, destroy+redeploy the affected shard to
+# cycle every mailbox at once.
+SHARED_MAILBOX_PASSWORD = "C0ldInfr412321!"
+
 
 def _load_lines(name: str) -> list[str]:
     return [line.strip() for line in (DATA_DIR / name).read_text().splitlines() if line.strip()]
@@ -65,7 +72,7 @@ def generate_mailboxes(root_domain: str, subdomain_labels: list[str], seed: int 
                 "fqdn": fqdn,
                 "local_part": local_part,
                 "email": f"{local_part}@{fqdn}",
-                "password": secrets.token_urlsafe(16),
+                "password": SHARED_MAILBOX_PASSWORD,
             })
             count += 1
 
