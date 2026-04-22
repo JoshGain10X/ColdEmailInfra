@@ -37,7 +37,11 @@ def _curl(method: str, base_url: str, path: str, token: str, body: dict | None =
         "-w", f"\n{_CURL_SENTINEL}%{{http_code}}",
     ]
     if body is not None:
-        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+        # Compact separators to match curl manually typed with awk-generated
+        # bodies byte-for-byte (no spaces after colons/commas). Python's
+        # default json.dumps adds spaces; not observably different on single
+        # requests but worth eliminating every variable.
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(body, separators=(",", ":"))]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -149,7 +153,9 @@ def main(
     if not csv_file.exists():
         raise click.ClickException(f"CSV not found at {csv_file}. Run deploy_shard first.")
 
-    tokens_raw = os.environ.get("BISON_API_TOKENS", "").strip()
+    # DIAGNOSTIC: hardcoded token to rule out env-loading as a factor.
+    # Revert to env-based tokens once we've confirmed the root cause.
+    tokens_raw = "15|rAfPeY4Y37rIn8iM2fYoYFj2THkEasT783WngEqV323d668e"
     if not tokens_raw:
         raise click.ClickException(
             "BISON_API_TOKENS not set in .env. Add a comma-separated list of "
