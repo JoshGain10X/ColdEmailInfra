@@ -204,25 +204,50 @@ def main(
     skipped: list[str] = []
     failed: list[tuple[str, str]] = []
 
+    # Per-row retry plan: Bison's sender-create 500s intermittently when
+    # its IMAP/SMTP validator pool is loaded. Waiting N seconds then
+    # retrying almost always works. Schedule favours patience: total
+    # worst-case ~3 min per stubborn row, which is a better user
+    # experience than scripting around Bison's bug.
+    retry_delays = [5, 10, 20, 40, 60]
+
     for i, row in enumerate(rows, 1):
         email = row.get("Email", "").strip()
         if not email:
             click.echo(f"  [{i:3}/{len(rows)}] row missing Email, skipping")
             continue
-        status, body = _curl("POST", base_url, "/api/sender-emails/imap-smtp", chosen_token, body=_row_to_payload(row))
+        payload = _row_to_payload(row)
 
-        if status == 201:
-            sid = (body.get("data") or {}).get("id")
-            if sid:
-                created_ids.append(sid)
-            click.echo(f"  [{i:3}/{len(rows)}] {email} — created (id={sid})")
-        elif status == 422 and _already_taken(body):
-            skipped.append(email)
-            click.echo(f"  [{i:3}/{len(rows)}] {email} — already exists, skipping")
-        else:
+        for attempt in range(len(retry_delays) + 1):
+            status, body = _curl(
+                "POST", base_url, "/api/sender-emails/imap-smtp",
+                chosen_token, body=payload,
+            )
+            if status == 201:
+                sid = (body.get("data") or {}).get("id")
+                if sid:
+                    created_ids.append(sid)
+                suffix = f" (attempt {attempt + 1})" if attempt else ""
+                click.echo(f"  [{i:3}/{len(rows)}] {email} — created (id={sid}){suffix}")
+                break
+            if status == 422 and _already_taken(body):
+                skipped.append(email)
+                click.echo(f"  [{i:3}/{len(rows)}] {email} — already exists, skipping")
+                break
+            # 500 or other transient error — wait and retry if we have budget.
+            if attempt < len(retry_delays):
+                delay = retry_delays[attempt]
+                click.echo(
+                    f"  [{i:3}/{len(rows)}] {email} — HTTP {status}, retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{len(retry_delays) + 1})"
+                )
+                time.sleep(delay)
+                continue
+            # Exhausted retries.
             err = f"HTTP {status}: {json.dumps(body)[:300]}"
             failed.append((email, err))
-            click.echo(f"  [{i:3}/{len(rows)}] {email} — FAILED: {err}")
+            click.echo(f"  [{i:3}/{len(rows)}] {email} — FAILED after {len(retry_delays) + 1} attempts: {err}")
+            break
 
         if throttle > 0:
             time.sleep(throttle)
