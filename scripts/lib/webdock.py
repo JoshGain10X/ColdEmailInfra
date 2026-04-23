@@ -6,7 +6,11 @@ import socket
 import time
 from typing import Any
 
-import webdock as webdock_sdk
+# Explicit submodule imports — webdock 1.0.1's __init__.py is empty, so
+# `import webdock; webdock.Webdock` fails. Reaching into `webdock.webdock`
+# and `webdock.exceptions` works on every 1.0.x release.
+from webdock.exceptions import WebdockException
+from webdock.webdock import Webdock as _WebdockSDK
 
 
 class WebdockClient:
@@ -25,7 +29,7 @@ class WebdockClient:
 
     def __init__(self, token: str | None = None):
         tok = (token or os.environ["WEBDOCK_API_TOKEN"]).strip()
-        self._sdk = webdock_sdk.Webdock(tok)
+        self._sdk = _WebdockSDK(tok)
 
     @staticmethod
     def _unwrap(resp: Any) -> Any:
@@ -122,7 +126,7 @@ class WebdockClient:
         slug = self._slugify(display_name)
         try:
             return self.get_instance(slug)
-        except webdock_sdk.exceptions.WebdockException as exc:
+        except WebdockException as exc:
             if "404" in str(exc):
                 return None
             raise
@@ -195,7 +199,7 @@ class WebdockClient:
         """
         try:
             self._sdk.delete_server(instance_id)
-        except webdock_sdk.exceptions.WebdockException as exc:
+        except WebdockException as exc:
             # 404 = already deleted; treat as success
             if "404" in str(exc):
                 return
