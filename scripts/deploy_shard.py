@@ -124,9 +124,24 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
     public_key = ssh_pub_path.read_text().strip()
     ssh_key_id = vps_client.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
 
-    # Seed instance_id from state or orphan lookup
+    # Seed instance_id from state or orphan lookup.
+    # Guard against provider mismatch: if the stored VPS was created by a
+    # different provider (e.g. legacy Contabo state file, no `provider` key
+    # at all → treat as contabo), ignore the stale id and start fresh on
+    # the current provider. The orphan VPS on the other provider is NOT
+    # auto-destroyed — user destroys it manually via the other provider's
+    # dashboard, or via `destroy_shard.py` before redeploying.
     vps_state = state.get("vps") or {}
-    instance_id = vps_state.get("id")
+    stored_provider = vps_state.get("provider", "contabo")
+    if vps_state.get("id") and stored_provider != provider:
+        click.echo(
+            f"  state references a {stored_provider} VPS ({vps_state['id']}), "
+            f"but this deploy is on {provider}. Ignoring stale entry and starting "
+            f"fresh — destroy the {stored_provider} VPS manually if it's still live."
+        )
+        instance_id = None
+    else:
+        instance_id = vps_state.get("id")
     if not instance_id:
         existing = vps_client.find_instance_by_display_name(display_name)
         if existing:
