@@ -275,7 +275,18 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
         click.echo(f"  {provider} PTR already {hostname} (public DNS still propagating)")
     else:
         click.echo(f"  Setting PTR to {hostname} via {provider} API")
-        vps_client.set_ptr(vps["id"], hostname)
+        try:
+            vps_client.set_ptr(vps["id"], hostname)
+        except Exception as exc:
+            # Non-blocking: PTR is cosmetic until outbound mail starts days
+            # later via Bison warmup. Webdock's identity-endpoint naming
+            # has shifted between releases; if our best-guess paths both
+            # fail, surface clear dashboard instructions and continue.
+            click.echo(f"  WARNING: {exc}")
+            click.echo(f"  Fix manually: {provider} dashboard -> {vps['id']} -> Server Identity -> Main Domain = {hostname}")
+            click.echo(f"  Cold email does not depend on this at deploy time; warmup happens days later.")
+            state.mark_step_done("set_ptr")
+            return
 
     # Best-effort public DNS report — does not block deploy.
     try:
