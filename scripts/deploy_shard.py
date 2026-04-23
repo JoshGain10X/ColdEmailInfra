@@ -26,18 +26,34 @@ from lib.contabo import ContaboClient
 from lib.generate import generate_mailboxes, pick_subdomains
 from lib.mailserver import MailserverClient
 from lib.state import ShardState, SHARDS_DIR
+from lib.webdock import WebdockClient
 
 
-def _load_env() -> None:
-    load_dotenv(override=True)
-    required = (
-        "CLOUDFLARE_API_TOKEN",
-        "CLOUDFLARE_ACCOUNT_ID",
+PROVIDER_ENV: dict[str, tuple[str, ...]] = {
+    "contabo": (
         "CONTABO_CLIENT_ID",
         "CONTABO_CLIENT_SECRET",
         "CONTABO_API_USER",
         "CONTABO_API_PASSWORD",
-    )
+    ),
+    "webdock": ("WEBDOCK_API_TOKEN",),
+}
+
+
+def _make_vps_client(provider: str):
+    if provider == "contabo":
+        return ContaboClient()
+    if provider == "webdock":
+        return WebdockClient()
+    raise click.ClickException(f"Unknown provider: {provider!r}")
+
+
+def _load_env(provider: str) -> None:
+    load_dotenv(override=True)
+    required: tuple[str, ...] = (
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_ACCOUNT_ID",
+    ) + PROVIDER_ENV.get(provider, ())
     for key in required:
         if not os.environ.get(key):
             raise click.ClickException(f"Missing env var: {key}")
@@ -98,24 +114,24 @@ def _step_generate(state: ShardState, domain: str) -> None:
     state.mark_step_done("generate")
 
 
-def _step_provision_vps(state: ShardState, domain: str, product_id: str, region: str, image_id: str) -> None:
+def _step_provision_vps(state: ShardState, domain: str, provider: str, product_id: str, region: str, image_id: str) -> None:
     if state.is_step_done("provision_vps"):
         return
-    click.echo("[2/10] Provisioning Contabo VPS")
-    cb = ContaboClient()
+    click.echo(f"[2/10] Provisioning VPS via {provider}")
+    vps_client = _make_vps_client(provider)
     display_name = _mail_hostname(domain)
     ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
     public_key = ssh_pub_path.read_text().strip()
-    ssh_key_id = cb.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
+    ssh_key_id = vps_client.find_or_create_ssh_key(f"coldemail-{domain}", public_key)
 
     # Seed instance_id from state or orphan lookup
     vps_state = state.get("vps") or {}
     instance_id = vps_state.get("id")
     if not instance_id:
-        existing = cb.find_instance_by_display_name(display_name)
+        existing = vps_client.find_instance_by_display_name(display_name)
         if existing:
-            instance_id = existing.get("instanceId") or existing.get("id")
-            click.echo(f"  Found existing Contabo instance {instance_id} (displayName '{display_name}'), reusing")
+            instance_id = existing["id"]
+            click.echo(f"  Found existing {provider} instance {instance_id} (name '{display_name}'), reusing")
 
     blocked_ips_tried: list[dict] = state.get("blocked_ips_tried") or []
     max_attempts = 3
@@ -126,7 +142,7 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
         # or we destroyed the previous one because its IP was blocklisted)
         if not instance_id:
             try:
-                inst = cb.create_instance(
+                inst = vps_client.create_instance(
                     display_name=display_name,
                     product_id=product_id,
                     region=region,
@@ -135,26 +151,27 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
                 )
             except requests.HTTPError as exc:
                 body = exc.response.text if exc.response is not None else str(exc)
-                if "not available" in body.lower() or "productid" in body.lower():
+                if provider == "contabo" and ("not available" in body.lower() or "productid" in body.lower()):
                     raise click.ClickException(
                         f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
                         f"Contabo does not expose a list-products API — pick a current productId from\n"
                         f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
-                        f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --contabo-product-id <id>), then re-run."
+                        f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --product-id <id>), then re-run."
                     )
                 raise
-            instance_id = inst.get("instanceId") or inst.get("id")
+            instance_id = inst["id"]
 
         # Save state immediately so a crash mid-wait doesn't lose track of the instance
         state.set("vps", {
+            "provider": provider,
             "id": instance_id,
             "ip": None,
             "product_id": product_id,
             "region": region,
         })
 
-        inst = cb.wait_for_instance_ready(instance_id)
-        ip = ((inst.get("ipConfig") or {}).get("v4") or {}).get("ip")
+        inst = vps_client.wait_for_instance_ready(instance_id)
+        ip = inst.get("ip")
 
         # Blocklist gate — Spamhaus Zen, Barracuda, SpamCop
         listed = blocklist.check_ip(ip)
@@ -166,7 +183,7 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
         blocked_ips_tried.append({"ip": ip, "listed_on": listed})
         state.set("blocked_ips_tried", blocked_ips_tried)
         try:
-            cb.destroy_instance(instance_id)
+            vps_client.destroy_instance(instance_id)
         except Exception as exc:
             click.echo(f"  warning: destroy failed for {instance_id}: {exc}")
         instance_id = None
@@ -177,12 +194,13 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
             f"  - {t['ip']} ({', '.join(t['listed_on'])})" for t in blocked_ips_tried
         )
         raise click.ClickException(
-            f"All {max_attempts} provisioned Contabo IPs were on a DNSBL:\n{summary}\n"
-            f"Contabo's IP pool may be hot right now; try a different region or retry later."
+            f"All {max_attempts} provisioned {provider} IPs were on a DNSBL:\n{summary}\n"
+            f"{provider}'s IP pool may be hot right now; try a different region or retry later."
         )
 
     # Clean IP obtained; persist final state
     state.set("vps", {
+        "provider": provider,
         "id": instance_id,
         "ip": ip,
         "product_id": product_id,
@@ -190,7 +208,7 @@ def _step_provision_vps(state: ShardState, domain: str, product_id: str, region:
     })
     if blocked_ips_tried:
         click.echo(f"  Clean IP {ip} obtained after {len(blocked_ips_tried)} blocklisted retries")
-    cb.wait_for_ssh(ip)
+    vps_client.wait_for_ssh(ip)
     state.mark_step_done("provision_vps")
 
 
@@ -198,8 +216,9 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
     if state.is_step_done("set_ptr"):
         return
     click.echo("[3/10] Setting PTR (reverse DNS)")
-    cb = ContaboClient()
     vps = state.get("vps")
+    provider = vps.get("provider", "contabo")
+    vps_client = _make_vps_client(provider)
     hostname = _mail_hostname(domain)
     rev = dns.reversename.from_address(vps["ip"])
 
@@ -213,13 +232,13 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
     except Exception:
         current = None
 
-    # Fast-path 2: Contabo already has it on file (previous run pushed but public DNS slow).
-    contabo_current = cb.get_ptr(vps["ip"])
-    if contabo_current == hostname:
-        click.echo(f"  Contabo PTR already {hostname} (public DNS still propagating)")
+    # Fast-path 2: provider already has it on file (previous run pushed but public DNS slow).
+    provider_current = vps_client.get_ptr(vps["ip"])
+    if provider_current == hostname:
+        click.echo(f"  {provider} PTR already {hostname} (public DNS still propagating)")
     else:
-        click.echo(f"  Setting PTR to {hostname} via Contabo API")
-        cb.set_ptr(vps["id"], hostname)  # Confirms via Contabo API internally
+        click.echo(f"  Setting PTR to {hostname} via {provider} API")
+        vps_client.set_ptr(vps["id"], hostname)
 
     # Best-effort public DNS report — does not block deploy.
     try:
@@ -230,7 +249,7 @@ def _step_set_ptr(state: ShardState, domain: str) -> None:
         click.echo(f"  Public DNS matches: {hostname}")
     else:
         click.echo(
-            f"  Contabo has PTR set. Public DNS still shows "
+            f"  {provider} has PTR set. Public DNS still shows "
             f"{public_now or '(nothing)'} — will propagate in 30–60 min. "
             f"Does not block deploy."
         )
@@ -384,12 +403,21 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
 
 @click.command()
 @click.option("--domain", required=True, help="Root domain, e.g. example.co.uk (purchased via CF Registrar if not already yours)")
-@click.option("--contabo-product-id", default=lambda: os.environ.get("CONTABO_PRODUCT_ID", "V91"),
-              help="Contabo product ID. V91 = current cheapest Cloud VPS. Check https://contabo.com/en/vps/ if this errors.")
-@click.option("--region", default=lambda: os.environ.get("CONTABO_REGION", "EU"),
-              help="Contabo region. EU (Germany), US-central, US-east, US-west, SIN, UK.")
-@click.option("--image-id", default=lambda: os.environ.get("CONTABO_IMAGE_ID", "d64d5c6c-9dda-4e38-8174-0ee282474d8a"),
-              help="Contabo image ID. Default is Ubuntu 22.04 LTS.")
+@click.option("--provider", type=click.Choice(["contabo", "webdock"]),
+              default=lambda: os.environ.get("DEFAULT_PROVIDER", "webdock"),
+              help="VPS provider. Webdock is pay-per-hour with credit refunded on destroy; "
+                   "Contabo is month-prepaid with no refund. Defaults to DEFAULT_PROVIDER env var or 'webdock'.")
+@click.option("--product-id", default=None,
+              help="Provider product slug. Contabo: productId like 'V91'. "
+                   "Webdock: profileSlug like 'webdocknano'. "
+                   "Defaults to CONTABO_PRODUCT_ID / WEBDOCK_PROFILE_SLUG env var.")
+@click.option("--region", default=None,
+              help="Provider region/location. Contabo: 'EU', 'US-central', 'UK', etc. "
+                   "Webdock: 'fi', 'nl', 'uk', 'us' (locationId). "
+                   "Defaults to CONTABO_REGION / WEBDOCK_LOCATION_ID env var.")
+@click.option("--image-id", default=None,
+              help="Provider image. Contabo: UUID. Webdock: slug like 'ubuntu-jammy-cloud'. "
+                   "Defaults to CONTABO_IMAGE_ID / WEBDOCK_IMAGE_SLUG env var.")
 @click.option("--skip-purchase", is_flag=True, help="Error out if domain isn't already on Cloudflare (don't buy via Registrar)")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip interactive confirmations (e.g. domain purchase)")
 @click.option("--ssl-type", type=click.Choice(["self-signed", "letsencrypt"]),
@@ -397,18 +425,36 @@ def _step_final_summary(state: ShardState, domain: str) -> None:
               help="TLS cert strategy. 'self-signed' = docker-mailserver uses a cert we generate (default, Bison skips verification). 'letsencrypt' = real cert via Cloudflare DNS-01 challenge.")
 def main(
     domain: str,
-    contabo_product_id: str,
-    region: str,
-    image_id: str,
+    provider: str,
+    product_id: str | None,
+    region: str | None,
+    image_id: str | None,
     skip_purchase: bool,
     assume_yes: bool,
     ssl_type: str,
 ) -> None:
-    _load_env()
+    _load_env(provider)
+    if provider == "contabo":
+        product_id = product_id or os.environ.get("CONTABO_PRODUCT_ID", "V91")
+        region = region or os.environ.get("CONTABO_REGION", "EU")
+        image_id = image_id or os.environ.get("CONTABO_IMAGE_ID", "d64d5c6c-9dda-4e38-8174-0ee282474d8a")
+    else:  # webdock
+        product_id = product_id or os.environ.get("WEBDOCK_PROFILE_SLUG")
+        region = region or os.environ.get("WEBDOCK_LOCATION_ID")
+        image_id = image_id or os.environ.get("WEBDOCK_IMAGE_SLUG")
+        missing = [n for n, v in (("profileSlug", product_id), ("locationId", region), ("imageSlug", image_id)) if not v]
+        if missing:
+            raise click.ClickException(
+                f"Webdock needs {', '.join(missing)} — set WEBDOCK_PROFILE_SLUG / "
+                f"WEBDOCK_LOCATION_ID / WEBDOCK_IMAGE_SLUG in .env, or pass "
+                f"--product-id / --region / --image-id. Run `python3 scripts/webdock_discover.py` "
+                f"to list available values."
+            )
+
     state = ShardState(domain)
     zone_id = _step_ensure_domain(state, domain, skip_purchase, assume_yes)
     _step_generate(state, domain)
-    _step_provision_vps(state, domain, contabo_product_id, region, image_id)
+    _step_provision_vps(state, domain, provider, product_id, region, image_id)
     _step_set_ptr(state, domain)
     _step_configure_dns(state, domain, zone_id)
     _step_install_mailserver(state, domain, ssl_type)

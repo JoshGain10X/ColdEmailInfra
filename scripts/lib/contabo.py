@@ -102,6 +102,17 @@ class ContaboClient:
     # Compute instances
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalise(raw: dict) -> dict:
+        """Map Contabo's instance JSON to the cross-provider canonical shape."""
+        v4 = ((raw.get("ipConfig") or {}).get("v4") or {})
+        return {
+            "id": raw.get("instanceId") or raw.get("id"),
+            "ip": v4.get("ip"),
+            "status": raw.get("status"),
+            "display_name": raw.get("displayName"),
+        }
+
     def create_instance(
         self,
         display_name: str,
@@ -120,11 +131,14 @@ class ContaboClient:
             "sshKeys": [ssh_key_id],
         }
         body = self._request("POST", "/compute/instances", json=payload)
+        return self._normalise(body["data"][0])
+
+    def _get_instance_raw(self, instance_id: int) -> dict:
+        body = self._request("GET", f"/compute/instances/{instance_id}")
         return body["data"][0]
 
     def get_instance(self, instance_id: int) -> dict:
-        body = self._request("GET", f"/compute/instances/{instance_id}")
-        return body["data"][0]
+        return self._normalise(self._get_instance_raw(instance_id))
 
     def find_instance_by_display_name(self, display_name: str) -> dict | None:
         """Return the first ACTIVE (non-cancelled) instance matching the given
@@ -147,21 +161,17 @@ class ContaboClient:
             instance_id = inst.get("instanceId") or inst.get("id")
             if instance_id is None:
                 continue
-            detail = self.get_instance(instance_id)
+            detail = self._get_instance_raw(instance_id)
             if detail.get("cancelDate") or detail.get("cancellationDate"):
                 continue
-            return detail
+            return self._normalise(detail)
         return None
 
     def wait_for_instance_ready(self, instance_id: int, timeout: int = 900) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
             inst = self.get_instance(instance_id)
-            status = inst.get("status")
-            ip_config = inst.get("ipConfig") or {}
-            v4 = ip_config.get("v4") or {}
-            ip = v4.get("ip")
-            if status == "running" and ip:
+            if inst.get("status") == "running" and inst.get("ip"):
                 return inst
             time.sleep(15)
         raise TimeoutError(f"Instance {instance_id} not ready within {timeout}s")
@@ -201,8 +211,7 @@ class ContaboClient:
         sending actually begins (days later via Bison warmup).
         """
         inst = self.get_instance(instance_id)
-        v4 = (inst.get("ipConfig") or {}).get("v4") or {}
-        ip = v4.get("ip")
+        ip = inst.get("ip")
         if not ip:
             raise RuntimeError(f"Instance {instance_id} has no IPv4 address yet")
         self._request("PUT", f"/dns/ptrs/{ip}", json={"ptr": hostname})
@@ -242,7 +251,7 @@ class ContaboClient:
         # the subsequent cancel is a fresh call or a no-op (instance was
         # already cancelled by a previous destroy).
         try:
-            current = self.get_instance(instance_id)
+            current = self._get_instance_raw(instance_id)
             current_name = current.get("displayName") or f"instance-{instance_id}"
             if "-cancelled-" not in current_name:
                 timestamp = time.strftime("%Y%m%dT%H%M%S")

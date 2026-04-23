@@ -15,6 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.cloudflare import CloudflareClient
 from lib.contabo import ContaboClient
 from lib.state import ShardState, SHARDS_DIR
+from lib.webdock import WebdockClient
+
+
+def _make_vps_client(provider: str):
+    if provider == "contabo":
+        return ContaboClient()
+    if provider == "webdock":
+        return WebdockClient()
+    raise click.ClickException(f"Unknown provider in state: {provider!r}")
 
 
 @click.command()
@@ -31,9 +40,11 @@ def main(domain: str, yes: bool) -> None:
 
     vps = state.get("vps")
     if vps and vps.get("id"):
-        click.echo(f"Destroying VPS {vps['id']}")
+        # Legacy state files may predate the provider field; default to contabo.
+        provider = vps.get("provider", "contabo")
+        click.echo(f"Destroying {provider} VPS {vps['id']}")
         try:
-            ContaboClient().destroy_instance(vps["id"])
+            _make_vps_client(provider).destroy_instance(vps["id"])
         except Exception as exc:
             click.echo(f"  VPS destroy warning: {exc}")
 
