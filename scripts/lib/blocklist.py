@@ -12,11 +12,14 @@ DNSBLS = [
 ]
 
 # Spamhaus Zen return codes we should IGNORE:
-#   127.0.0.10 = PBL (ISP policy block — normal for VPS IPs)
-#   127.0.0.11 = PBL (ISP maintained)
-# These are not spam listings; they just mean "this IP range is meant for
-# end-user dynamic/VPS use." Proper SPF/DKIM/DMARC overrides PBL concerns.
-_SPAMHAUS_PBL = {"127.0.0.10", "127.0.0.11"}
+#   127.0.0.10    = PBL (ISP policy block — normal for VPS IPs)
+#   127.0.0.11    = PBL (ISP maintained)
+#   127.255.255.254 = "query via public resolver" — not a real listing;
+#                     Spamhaus returns this when queried through shared/public
+#                     DNS resolvers (8.8.8.8, 1.1.1.1, etc.) instead of a
+#                     dedicated recursive resolver.
+#   127.255.255.255 = "query rate limited" — also not a real listing.
+_SPAMHAUS_IGNORE = {"127.0.0.10", "127.0.0.11", "127.255.255.254", "127.255.255.255"}
 
 
 def check_ip(ip: str) -> list[str]:
@@ -33,7 +36,7 @@ def check_ip(ip: str) -> list[str]:
             if zone == "zen.spamhaus.org":
                 # Filter out PBL-only results
                 codes = {rdata.address for rdata in answers}
-                if codes - _SPAMHAUS_PBL:
+                if codes - _SPAMHAUS_IGNORE:
                     # Has non-PBL listings (SBL/XBL/CSS) — genuinely blocklisted
                     listed.append(zone)
                 # else: PBL-only, ignore
