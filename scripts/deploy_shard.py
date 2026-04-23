@@ -288,7 +288,7 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
     redirect_target = os.environ.get("REDIRECT_TARGET", "https://10xmanagers.com")
     mail_host = _mail_hostname(domain)
 
-    cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=False)
+    cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=True)
     cf.upsert_record(zone_id, "A", mail_host, vps_ip, proxied=False)
     cf.upsert_record(
         zone_id, "TXT", f"_dmarc.{domain}",
@@ -298,10 +298,15 @@ def _step_configure_dns(state: ShardState, domain: str, zone_id: str) -> None:
     for sub in subs:
         fqdn = f"{sub}.{domain}"
         sub_mail = f"mail.{fqdn}"
-        cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=False)
+        # Proxy subdomain A records through Cloudflare so redirect rules work.
+        # mail.* records must stay unproxied for actual mail delivery.
+        cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=(sub != "mail"))
         cf.upsert_record(zone_id, "A", sub_mail, vps_ip, proxied=False)
         cf.upsert_record(zone_id, "MX", fqdn, sub_mail, priority=10)
-        cf.upsert_record(zone_id, "TXT", fqdn, "v=spf1 a mx -all")
+        # Use ip4 instead of 'a' in SPF because proxied A records resolve to
+        # Cloudflare IPs, not the mail server. 'mx' still works since mail.*
+        # records remain unproxied.
+        cf.upsert_record(zone_id, "TXT", fqdn, f"v=spf1 ip4:{vps_ip} mx -all")
         cf.upsert_record(
             zone_id, "TXT", f"_dmarc.{fqdn}",
             f"v=DMARC1; p=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",

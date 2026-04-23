@@ -232,7 +232,7 @@ class CloudflareClient:
 
         new_rule = {
             "description": f"Redirect {source_domain} to {target}",
-            "expression": f'(http.host eq "{source_domain}") or (http.host eq "www.{source_domain}")',
+            "expression": f'(http.host eq "{source_domain}") or (http.host eq "www.{source_domain}") or (http.host contains ".{source_domain}")',
             "action": "redirect",
             "action_parameters": {
                 "from_value": {
