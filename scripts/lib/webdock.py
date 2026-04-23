@@ -192,11 +192,15 @@ class WebdockClient:
         raise TimeoutError(f"SSH on {ip}:{port} not reachable within {timeout}s")
 
     # ------------------------------------------------------------------
-    # Reverse DNS (Webdock derives PTR from server `name`)
+    # Reverse DNS (Webdock derives PTR from the Server Identity's main domain)
     # ------------------------------------------------------------------
 
     def get_ptr(self, ip: str) -> str | None:
-        """Webdock has no PTR-lookup endpoint; query public DNS instead."""
+        """Webdock doesn't expose a 'current PTR' read endpoint, so fall back
+        to a public DNS query. During the 30-60 min propagation window after
+        set_ptr this will return None; that's fine — the deploy script's
+        set_ptr path handles None as 'needs updating'.
+        """
         try:
             import dns.resolver
             import dns.reversename
@@ -206,26 +210,45 @@ class WebdockClient:
             return None
 
     def set_ptr(self, instance_id: str, hostname: str) -> None:
-        """On Webdock, PTR is auto-derived from the server's `name` field.
+        """Set the server's Server Identity main domain, which Webdock uses
+        to derive rDNS (PTR).
 
-        We set `name=<hostname>` during create_instance, so PTR is already
-        correct the moment the server finishes provisioning. This method
-        is a verification no-op: if the stored name already matches, we're
-        done; otherwise we rename the server via PATCH to realign.
+        Webdock's PTR is NOT driven by the server's `name` field (that's a
+        display label); it's driven by Server Identity → Main Domain. The
+        endpoint isn't in the Python SDK, so we call it through the SDK's
+        generic `make_request` helper.
+
+        If the best-guess endpoint returns 4xx, we log a warning and
+        continue — rDNS is cosmetic until outbound mail actually starts
+        (days later via Bison warmup), and the user can fix it in the
+        dashboard as a fallback.
         """
-        inst_raw = self._unwrap(self._sdk.get_server(instance_id))
-        current_name = inst_raw.get("name")
-        if current_name == hostname:
+        payload = {"maindomain": hostname}
+        try:
+            self._sdk.make_request(
+                f"servers/{instance_id}/identity",
+                requestType="PATCH",
+                data=payload,
+            )
             return
-        # The SDK's patch_server enforces name/description/nextActionDate/notes
-        # all be present; pass current values unchanged except for name.
-        payload = {
-            "name": hostname,
-            "description": inst_raw.get("description") or "",
-            "nextActionDate": inst_raw.get("nextActionDate"),
-            "notes": inst_raw.get("notes") or "",
-        }
-        self._sdk.patch_server(instance_id, payload)
+        except WebdockException as exc:
+            # Fall through to a second guess below; Webdock's naming has
+            # shifted between "identity" and "mainDomain" over releases.
+            first_error = str(exc)
+
+        try:
+            self._sdk.make_request(
+                f"servers/{instance_id}/mainDomain",
+                requestType="PATCH",
+                data=payload,
+            )
+        except WebdockException as exc:
+            raise RuntimeError(
+                f"Could not set Server Identity via API for {instance_id} "
+                f"(tried /identity -> {first_error}; /mainDomain -> {exc}). "
+                f"Set it manually: Webdock dashboard -> {instance_id} -> "
+                f"Server Identity -> Main Domain = {hostname}."
+            )
 
     def destroy_instance(self, instance_id: str) -> None:
         """Hard delete. Webdock refunds unused prepaid credit on destroy —

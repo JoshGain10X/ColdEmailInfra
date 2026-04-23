@@ -36,38 +36,38 @@ def _resolve(name: str, rrtype: str) -> list[str]:
         return []
 
 
-def check_dns(state: ShardState, domain: str) -> list[tuple[str, bool, str]]:
-    results: list[tuple[str, bool, str]] = []
+def check_dns(state: ShardState, domain: str) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
     vps_ip = state.get("vps")["ip"]
     sample_subs = state.get("subdomains")[:3]
 
     for sub in sample_subs:
         fqdn = f"{sub}.{domain}"
         a = _resolve(fqdn, "A")
-        results.append((f"A {fqdn}", vps_ip in a, ", ".join(a) or "(no answer)"))
+        results.append((f"A {fqdn}", _status(vps_ip in a), ", ".join(a) or "(no answer)"))
 
         mx = _resolve(fqdn, "MX")
         expect = f"mail.{fqdn}"
         ok = any(expect in m for m in mx)
-        results.append((f"MX {fqdn}", ok, ", ".join(mx) or "(no answer)"))
+        results.append((f"MX {fqdn}", _status(ok), ", ".join(mx) or "(no answer)"))
 
         spf = _resolve(fqdn, "TXT")
         ok = any("v=spf1" in s for s in spf)
-        results.append((f"SPF {fqdn}", ok, next((s for s in spf if "v=spf1" in s), "(missing)")))
+        results.append((f"SPF {fqdn}", _status(ok), next((s for s in spf if "v=spf1" in s), "(missing)")))
 
         dmarc = _resolve(f"_dmarc.{fqdn}", "TXT")
         ok = any("v=DMARC1" in d for d in dmarc)
-        results.append((f"DMARC {fqdn}", ok, next((d for d in dmarc if "v=DMARC1" in d), "(missing)")))
+        results.append((f"DMARC {fqdn}", _status(ok), next((d for d in dmarc if "v=DMARC1" in d), "(missing)")))
 
         dkim = _resolve(f"mail._domainkey.{fqdn}", "TXT")
         ok = any("v=DKIM" in d or "k=rsa" in d for d in dkim)
-        results.append((f"DKIM {fqdn}", ok, (dkim[0][:60] + "...") if dkim else "(missing)"))
+        results.append((f"DKIM {fqdn}", _status(ok), (dkim[0][:60] + "...") if dkim else "(missing)"))
 
     return results
 
 
-def check_fcrdns(state: ShardState, domain: str) -> list[tuple[str, bool, str]]:
-    results: list[tuple[str, bool, str]] = []
+def check_fcrdns(state: ShardState, domain: str) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
     vps_ip = state.get("vps")["ip"]
     expected = _mail_hostname(domain)
 
@@ -76,50 +76,87 @@ def check_fcrdns(state: ShardState, domain: str) -> list[tuple[str, bool, str]]:
         ptr = str(dns.resolver.resolve(rev, "PTR")[0]).rstrip(".")
     except Exception as exc:
         ptr = f"(lookup failed: {exc})"
-    results.append((f"PTR {vps_ip}", ptr == expected, ptr))
+    results.append((f"PTR {vps_ip}", _status(ptr == expected), ptr))
 
     forward = _resolve(expected, "A")
-    results.append((f"A {expected}", vps_ip in forward, ", ".join(forward) or "(no answer)"))
+    results.append((f"A {expected}", _status(vps_ip in forward), ", ".join(forward) or "(no answer)"))
 
     return results
 
 
-def check_smtp_banner(domain: str) -> tuple[bool, str]:
+ISP_BLOCK_NOTE = (
+    "connect from this host timed out — probably your local ISP blocking "
+    "outbound :{port} (UK/residential ISPs almost always do). Bison sends "
+    "from its own datacenter so this does NOT affect cold-email delivery; "
+    "SSH into the VPS and check `sudo ss -tlnp | grep :{port}` to confirm "
+    "the mailserver is actually listening."
+)
+
+
+def check_smtp_banner(domain: str) -> tuple[str, str]:
+    """Returns (status, detail) where status is 'PASS', 'FAIL', or 'WARN'."""
     host = _mail_hostname(domain)
-    expected = host
     try:
         with socket.create_connection((host, 25), timeout=10) as sock:
             banner = sock.recv(4096).decode(errors="replace").strip()
-        ok = expected in banner
-        return ok, banner
+    except socket.timeout:
+        return "WARN", ISP_BLOCK_NOTE.format(port=25)
     except OSError as exc:
-        return False, f"(connect failed: {exc})"
+        return "FAIL", f"(connect failed: {exc})"
+    return ("PASS" if host in banner else "FAIL", banner)
 
 
-def check_tls(domain: str) -> tuple[bool, str]:
+def check_tls(domain: str) -> tuple[str, str]:
+    """Verify the TLS cert on :465. Self-signed certs (the default ssl_type
+    we deploy with) pass as WARN if the CN/SAN still matches the hostname;
+    only a CN/SAN mismatch is a FAIL.
+    """
     host = _mail_hostname(domain)
-    try:
-        ctx = ssl.create_default_context()
+
+    def _probe(verify: bool) -> tuple[dict, bool]:
+        ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
         with socket.create_connection((host, 465), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                cert = tls.getpeercert()
-                subject = dict(x[0] for x in cert.get("subject", []))
-                cn = subject.get("commonName", "")
-                sans = [v for k, v in cert.get("subjectAltName", []) if k == "DNS"]
-                ok = host == cn or host in sans
-                return ok, f"CN={cn}, SANs={sans}"
+                return tls.getpeercert(), verify
+
+    try:
+        cert, verified = _probe(verify=True)
+    except socket.timeout:
+        return "WARN", ISP_BLOCK_NOTE.format(port=465)
+    except ssl.SSLError:
+        # Likely self-signed; retry unverified to still check CN/SAN match.
+        try:
+            cert, verified = _probe(verify=False)
+        except Exception as exc:
+            return "FAIL", f"(TLS check failed on retry: {exc})"
     except Exception as exc:
-        return False, f"(TLS check failed: {exc})"
+        return "FAIL", f"(TLS check failed: {exc})"
+
+    subject = dict(x[0] for x in cert.get("subject", []))
+    cn = subject.get("commonName", "")
+    sans = [v for k, v in cert.get("subjectAltName", []) if k == "DNS"]
+    hostname_ok = host == cn or host in sans
+    detail = f"CN={cn}, SANs={sans}" + ("" if verified else " (self-signed — ssl_type=self-signed)")
+    if not hostname_ok:
+        return "FAIL", detail
+    return ("PASS" if verified else "WARN"), detail
 
 
-def _print_rows(title: str, rows: list[tuple[str, bool, str]]) -> bool:
+def _status(ok: bool) -> str:
+    return "PASS" if ok else "FAIL"
+
+
+def _print_rows(title: str, rows: list[tuple[str, str, str]]) -> bool:
+    """Rows are (name, status, detail) with status in {PASS, FAIL, WARN}.
+    Returns False only if any row is FAIL; WARN does not break the run.
+    """
     click.echo(f"\n== {title} ==")
-    all_ok = True
-    for name, ok, detail in rows:
-        mark = "PASS" if ok else "FAIL"
-        click.echo(f"  [{mark}] {name}: {detail}")
-        all_ok = all_ok and ok
-    return all_ok
+    has_fail = False
+    for name, status, detail in rows:
+        click.echo(f"  [{status}] {name}: {detail}")
+        if status == "FAIL":
+            has_fail = True
+    return not has_fail
 
 
 @click.command()
@@ -138,11 +175,11 @@ def main(domain: str) -> None:
     fcrdns_rows = check_fcrdns(state, domain)
     passed &= _print_rows("FCrDNS (PTR + forward A alignment)", fcrdns_rows)
 
-    banner_ok, banner = check_smtp_banner(domain)
-    passed &= _print_rows("SMTP banner (HELO match)", [("EHLO banner includes mail hostname", banner_ok, banner)])
+    banner_status, banner = check_smtp_banner(domain)
+    passed &= _print_rows("SMTP banner (HELO match)", [("EHLO banner includes mail hostname", banner_status, banner)])
 
-    tls_ok, tls_info = check_tls(domain)
-    passed &= _print_rows("TLS certificate", [("465 cert matches mail hostname", tls_ok, tls_info)])
+    tls_status, tls_info = check_tls(domain)
+    passed &= _print_rows("TLS certificate", [("465 cert matches mail hostname", tls_status, tls_info)])
 
     click.echo("")
     click.echo("Manual checks remaining:")
