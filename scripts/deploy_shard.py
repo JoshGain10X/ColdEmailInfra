@@ -213,6 +213,11 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
             f"{provider}'s IP pool may be hot right now; try a different region or retry later."
         )
 
+    # Create a sudoer shell user on the VM with our SSH key attached.
+    # No-op on Contabo (admin preconfigured at provision); on Webdock the
+    # cloud image ships without any shell user, so this is mandatory.
+    ssh_user = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
+
     # Clean IP obtained; persist final state
     state.set("vps", {
         "provider": provider,
@@ -220,11 +225,22 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
         "ip": ip,
         "product_id": product_id,
         "region": region,
+        "ssh_user": ssh_user,
     })
     if blocked_ips_tried:
         click.echo(f"  Clean IP {ip} obtained after {len(blocked_ips_tried)} blocklisted retries")
     vps_client.wait_for_ssh(ip)
     state.mark_step_done("provision_vps")
+
+
+def _ssh_user(state: ShardState) -> str:
+    """Where to pull the SSH username from for MailserverClient calls.
+
+    Priority: shard state (set during provision) → env override → 'admin'
+    default (Contabo's default, also the convention we use on Webdock).
+    """
+    vps = state.get("vps") or {}
+    return vps.get("ssh_user") or os.environ.get("SSH_USER", "admin")
 
 
 def _step_set_ptr(state: ShardState, domain: str) -> None:
@@ -316,7 +332,7 @@ def _step_install_mailserver(state: ShardState, domain: str, ssl_type: str) -> N
     vps = state.get("vps")
     le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-    ssh_user = os.environ.get("SSH_USER", "admin")
+    ssh_user = _ssh_user(state)
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
@@ -350,7 +366,7 @@ def _step_create_mailboxes(state: ShardState) -> None:
     click.echo("[6/10] Creating 100 mailboxes")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-    ssh_user = os.environ.get("SSH_USER", "admin")
+    ssh_user = _ssh_user(state)
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
@@ -370,7 +386,7 @@ def _step_setup_dkim(state: ShardState, domain: str, zone_id: str) -> None:
     click.echo("[7/10] Generating DKIM keys and publishing to Cloudflare")
     vps = state.get("vps")
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-    ssh_user = os.environ.get("SSH_USER", "admin")
+    ssh_user = _ssh_user(state)
     cf = CloudflareClient()
     dkim: dict[str, str] = state.get("dkim") or {}
 

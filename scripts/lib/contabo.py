@@ -140,6 +140,14 @@ class ContaboClient:
     def get_instance(self, instance_id: int) -> dict:
         return self._normalise(self._get_instance_raw(instance_id))
 
+    def ensure_ssh_user(self, instance_id: int, ssh_key_id: int, username: str = "admin") -> str:
+        """No-op on Contabo: the sshKeys array on POST /compute/instances
+        attaches the key to the default `admin` user at provision time. This
+        exists only so _step_provision_vps can call it uniformly across
+        providers.
+        """
+        return username
+
     def find_instance_by_display_name(self, display_name: str) -> dict | None:
         """Return the first ACTIVE (non-cancelled) instance matching the given
         display name, or None.

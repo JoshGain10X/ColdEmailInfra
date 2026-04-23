@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import socket
+import string
 import time
 from typing import Any
 
@@ -116,6 +118,40 @@ class WebdockClient:
         """instance_id is the Webdock slug."""
         resp = self._unwrap(self._sdk.get_server(instance_id))
         return self._normalise(resp)
+
+    def ensure_ssh_user(self, instance_id: str, ssh_key_id: int, username: str = "admin") -> str:
+        """Create a sudoer shell user on the VM with our SSH key attached.
+
+        Webdock's cloud images (webdock-ubuntu-*-cloud) ship with no shell
+        user at all — SSH fails with 'Permission denied (publickey)' on
+        every possible username until you create one via the API or
+        dashboard. The `publicKeys` array on POST /servers uploads the key
+        to the account library but does not attach it to any VM user.
+
+        Idempotent: if `username` already exists on the server, returns
+        unchanged (does NOT re-attach the key, to avoid clobbering any
+        manual setup the user may have done).
+
+        Returns the SSH username to use for subsequent paramiko connects.
+        """
+        existing = self._unwrap(self._sdk.get_shellusers(instance_id)) or []
+        for u in existing:
+            if u.get("username") == username:
+                return username
+        # Webdock password policy: letters + digits only, no punctuation.
+        # We never use this password (SSH is key-only downstream), but the
+        # API requires one at create time.
+        alphabet = string.ascii_letters + string.digits
+        password = "".join(secrets.choice(alphabet) for _ in range(32))
+        self._sdk.create_shelluser(
+            serverSlug=instance_id,
+            username=username,
+            password=password,
+            group="sudo",
+            shell="/bin/bash",
+            publicKeys=[ssh_key_id],
+        )
+        return username
 
     def find_instance_by_display_name(self, display_name: str) -> dict | None:
         """Look up a server by its slug (derived from display_name).
