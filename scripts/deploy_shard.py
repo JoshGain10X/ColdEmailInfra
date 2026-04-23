@@ -216,7 +216,10 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
     # Create a sudoer shell user on the VM with our SSH key attached.
     # No-op on Contabo (admin preconfigured at provision); on Webdock the
     # cloud image ships without any shell user, so this is mandatory.
-    ssh_user = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
+    # Returns {username, password}; password is non-None on fresh Webdock
+    # creates and is used later to bootstrap passwordless sudo over SSH
+    # (Webdock's passwordlessSudo setting is dashboard-only, not an API field).
+    ssh_credentials = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
 
     # Clean IP obtained; persist final state
     state.set("vps", {
@@ -225,7 +228,10 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
         "ip": ip,
         "product_id": product_id,
         "region": region,
-        "ssh_user": ssh_user,
+        "ssh_user": ssh_credentials["username"],
+        # Stored only until _step_install_mailserver consumes it on the next
+        # step. Cleared from state immediately after bootstrap succeeds.
+        "ssh_bootstrap_password": ssh_credentials.get("password"),
     })
     if blocked_ips_tried:
         click.echo(f"  Clean IP {ip} obtained after {len(blocked_ips_tried)} blocklisted retries")
@@ -336,6 +342,16 @@ def _step_install_mailserver(state: ShardState, domain: str, ssl_type: str) -> N
     ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
     ms.connect()
     try:
+        # Webdock cloud images don't pre-configure passwordless sudo, so the
+        # shell user we created at provision time needs it bootstrapped once
+        # (writes /etc/sudoers.d/99-<user>). The password we used at user
+        # creation was stashed in state; consume and clear it here.
+        bootstrap_pw = vps.get("ssh_bootstrap_password")
+        if bootstrap_pw:
+            click.echo(f"  Bootstrapping passwordless sudo for {ssh_user}")
+            ms.bootstrap_passwordless_sudo(bootstrap_pw)
+            vps_cleaned = {k: v for k, v in vps.items() if k != "ssh_bootstrap_password"}
+            state.set("vps", vps_cleaned)
         # Self-healing: if the step is already marked done and the container
         # is actually healthy, skip. Otherwise re-run install to fix whatever
         # broke (missing LE cert, bad config, crash loop).

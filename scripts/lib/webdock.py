@@ -119,7 +119,7 @@ class WebdockClient:
         resp = self._unwrap(self._sdk.get_server(instance_id))
         return self._normalise(resp)
 
-    def ensure_ssh_user(self, instance_id: str, ssh_key_id: int, username: str = "admin") -> str:
+    def ensure_ssh_user(self, instance_id: str, ssh_key_id: int, username: str = "admin") -> dict:
         """Create a sudoer shell user on the VM with our SSH key attached.
 
         Webdock's cloud images (webdock-ubuntu-*-cloud) ship with no shell
@@ -128,19 +128,18 @@ class WebdockClient:
         dashboard. The `publicKeys` array on POST /servers uploads the key
         to the account library but does not attach it to any VM user.
 
-        Idempotent: if `username` already exists on the server, returns
-        unchanged (does NOT re-attach the key, to avoid clobbering any
-        manual setup the user may have done).
-
-        Returns the SSH username to use for subsequent paramiko connects.
+        Returns a dict of the form {"username": str, "password": str | None}.
+        `password` is the generated sudo password on first creation (so the
+        caller can bootstrap passwordless sudo over SSH by echoing it into
+        `sudo -S`). If the user already existed — we cannot recover their
+        password — returns None, and passwordless sudo must be enabled
+        manually in the dashboard.
         """
         existing = self._unwrap(self._sdk.get_shellusers(instance_id)) or []
         for u in existing:
             if u.get("username") == username:
-                return username
+                return {"username": username, "password": None}
         # Webdock password policy: letters + digits only, no punctuation.
-        # We never use this password (SSH is key-only downstream), but the
-        # API requires one at create time.
         alphabet = string.ascii_letters + string.digits
         password = "".join(secrets.choice(alphabet) for _ in range(32))
         self._sdk.create_shelluser(
@@ -151,7 +150,7 @@ class WebdockClient:
             shell="/bin/bash",
             publicKeys=[ssh_key_id],
         )
-        return username
+        return {"username": username, "password": password}
 
     def find_instance_by_display_name(self, display_name: str) -> dict | None:
         """Look up a server by its slug (derived from display_name).

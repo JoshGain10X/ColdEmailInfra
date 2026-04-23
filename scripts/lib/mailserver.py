@@ -84,6 +84,42 @@ class MailserverClient:
         """Run a command as root via passwordless sudo."""
         return self.run(f"sudo -n {cmd}", check=check)
 
+    def bootstrap_passwordless_sudo(self, password: str) -> None:
+        """Grant the current SSH user passwordless sudo by writing
+        /etc/sudoers.d/99-<user> via a one-time password-based `sudo -S`.
+
+        Needed on Webdock cloud images where the shell user is created with
+        a password but `passwordlessSudo` is a dashboard-only toggle (not
+        exposed on the shellUsers API). Called once at the start of the
+        install step; subsequent `sudo -n` calls in this client work
+        unprompted.
+
+        Idempotent: if the sudoers.d file already exists (prior resume),
+        returns without re-writing.
+        """
+        _, out, _ = self.run("sudo -n true 2>/dev/null; echo $?", check=False)
+        if out.strip().endswith("0"):
+            return  # already passwordless
+        # Password came from our own secrets.choice(string.ascii_letters+digits),
+        # so no shell-meta characters to escape.
+        sudoers_path = f"/etc/sudoers.d/99-{self.user}"
+        sudoers_line = f"{self.user} ALL=(ALL) NOPASSWD: ALL"
+        cmd = (
+            f"echo '{password}' | sudo -S sh -c "
+            f"\"echo '{sudoers_line}' > {sudoers_path} && chmod 440 {sudoers_path}\""
+        )
+        rc, _, err = self.run(cmd, check=False)
+        if rc != 0:
+            raise RuntimeError(
+                f"Failed to bootstrap passwordless sudo for {self.user}: {err.strip()}"
+            )
+        # Verify it actually took.
+        _, out, _ = self.run("sudo -n true 2>/dev/null; echo $?", check=False)
+        if not out.strip().endswith("0"):
+            raise RuntimeError(
+                f"Wrote {sudoers_path} but `sudo -n` still prompts for password"
+            )
+
     def upload_text(self, content: str, remote_path: str) -> None:
         assert self.ssh is not None
         sftp = self.ssh.open_sftp()
