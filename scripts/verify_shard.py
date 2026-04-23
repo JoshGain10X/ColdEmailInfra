@@ -44,7 +44,14 @@ def check_dns(state: ShardState, domain: str) -> list[tuple[str, str, str]]:
     for sub in sample_subs:
         fqdn = f"{sub}.{domain}"
         a = _resolve(fqdn, "A")
-        results.append((f"A {fqdn}", _status(vps_ip in a), ", ".join(a) or "(no answer)"))
+        if sub == "mail":
+            # mail.* records are unproxied — must resolve to VPS IP directly.
+            a_ok = vps_ip in a
+        else:
+            # Proxied subdomains resolve to Cloudflare IPs, not VPS IP.
+            # Any A response means the record exists and is proxied correctly.
+            a_ok = len(a) > 0
+        results.append((f"A {fqdn}", _status(a_ok), ", ".join(a) or "(no answer)"))
 
         mx = _resolve(fqdn, "MX")
         expect = f"mail.{fqdn}"
