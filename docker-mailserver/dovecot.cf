@@ -1,0 +1,11 @@
+# Overrides for docker-mailserver's Dovecot configuration.
+# Loaded via /tmp/docker-mailserver/dovecot.cf inside the container.
+
+# Bison holds ~1 persistent IMAP connection per sender mailbox.
+# Default (100) saturates at ~48 senders; 500 gives headroom for
+# 100 mailboxes + LMTP delivery + login processes.
+default_process_limit = 500
+
+# Default is 10 per user per IP. Bison may open multiple IMAP
+# connections per mailbox from the same server IP.
+mail_max_userip_connections = 50

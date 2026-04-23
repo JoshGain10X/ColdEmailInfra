@@ -256,7 +256,7 @@ class MailserverClient:
             return ""
         email = f"postmaster@mail.{root_domain}"
         password = secrets.token_urlsafe(24)
-        _, hash_out, _ = self.run(f"openssl passwd -6 '{password}'")
+        _, hash_out, _ = self.run(f"echo '{password}' | openssl passwd -6 -stdin")
         pw_hash = hash_out.strip()
         line = f"{email}|{{SHA512-CRYPT}}{pw_hash}\n"
         self.upload_text(line, accounts_file)
@@ -289,6 +289,9 @@ class MailserverClient:
         env = env.replace("__MAIL_HOSTNAME__", f"mail.{root_domain}")
         env = env.replace("__SSL_TYPE__", ssl_type)
         self.upload_text(env, f"{workdir}/mailserver.env")
+
+        dovecot_cf = (DMS_TEMPLATE_DIR / "dovecot.cf").read_text()
+        self.upload_text(dovecot_cf, f"{workdir}/docker-data/dms/config/dovecot.cf")
 
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
