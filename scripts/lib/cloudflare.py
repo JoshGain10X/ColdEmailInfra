@@ -209,10 +209,26 @@ class CloudflareClient:
         Uses the Rulesets API (zone-level http_request_dynamic_redirect phase).
         """
         phase = "http_request_dynamic_redirect"
-        body = self._request("GET", f"/zones/{zone_id}/rulesets/phases/{phase}/entrypoint")
-        ruleset = body.get("result") or {}
-        ruleset_id = ruleset.get("id")
-        existing_rules = ruleset.get("rules") or []
+        # A 404 means no ruleset exists yet for this phase — that's normal
+        # on fresh zones.  Bypass _request() so we can handle 404 gracefully.
+        resp = self.session.get(
+            f"{API_BASE}/zones/{zone_id}/rulesets/phases/{phase}/entrypoint",
+            timeout=30,
+        )
+        if resp.status_code == 404:
+            ruleset_id = None
+            existing_rules = []
+        elif resp.status_code >= 400:
+            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            errors = body.get("errors") or body.get("messages") or body
+            raise RuntimeError(
+                f"Cloudflare API {resp.status_code} on GET /zones/{zone_id}/rulesets/phases/{phase}/entrypoint: {errors}"
+            )
+        else:
+            body = resp.json()
+            ruleset = body.get("result") or {}
+            ruleset_id = ruleset.get("id")
+            existing_rules = ruleset.get("rules") or []
 
         new_rule = {
             "description": f"Redirect {source_domain} to {target}",
