@@ -35,14 +35,18 @@ def main(location: str | None) -> None:
         click.echo(f"\nProfiles @ {loc_id}:")
         profiles = c._unwrap(c._sdk.get_profiles(loc_id)) or []
         for p in profiles:
-            ram = p.get("ram")
-            cpu = (p.get("cpu") or {}).get("cores")
-            disk = p.get("disk")
-            price = (p.get("price") or {}).get("amount")
-            currency = (p.get("price") or {}).get("currency") or ""
+            # Webdock returns RAM + disk in MB and price in eurocents.
+            # CPU is reported under different keys across product lines
+            # (vps-* profiles omit cpu.cores; wp-* profiles populate it).
+            cpu = (p.get("cpu") or {}).get("cores") or p.get("threads") or "?"
+            ram_mb = p.get("ram") or 0
+            disk_mb = p.get("disk") or 0
+            price_cents = (p.get("price") or {}).get("amount") or 0
+            currency = (p.get("price") or {}).get("currency") or "EUR"
             click.echo(
                 f"  {p.get('slug'):<28} {p.get('name'):<24} "
-                f"{cpu}vCPU / {ram}MB RAM / {disk}GB  {price} {currency}/mo"
+                f"{cpu}vCPU / {ram_mb / 1024:.1f}GB RAM / {disk_mb / 1024:.0f}GB disk  "
+                f"€{price_cents / 100:.2f} {currency}/mo"
             )
 
     click.echo("\nImages (Ubuntu only):")
