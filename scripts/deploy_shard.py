@@ -148,70 +148,45 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
             instance_id = existing["id"]
             click.echo(f"  Found existing {provider} instance {instance_id} (name '{display_name}'), reusing")
 
-    blocked_ips_tried: list[dict] = state.get("blocked_ips_tried") or []
-    max_attempts = 3
     ip: str | None = None
 
-    for attempt in range(1, max_attempts + 1):
-        # Create a fresh instance if we don't have one yet (first iteration,
-        # or we destroyed the previous one because its IP was blocklisted)
-        if not instance_id:
-            try:
-                inst = vps_client.create_instance(
-                    display_name=display_name,
-                    product_id=product_id,
-                    region=region,
-                    ssh_key_id=ssh_key_id,
-                    image_id=image_id,
-                )
-            except requests.HTTPError as exc:
-                body = exc.response.text if exc.response is not None else str(exc)
-                if provider == "contabo" and ("not available" in body.lower() or "productid" in body.lower()):
-                    raise click.ClickException(
-                        f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
-                        f"Contabo does not expose a list-products API — pick a current productId from\n"
-                        f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
-                        f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --product-id <id>), then re-run."
-                    )
-                raise
-            instance_id = inst["id"]
-
-        # Save state immediately so a crash mid-wait doesn't lose track of the instance
-        state.set("vps", {
-            "provider": provider,
-            "id": instance_id,
-            "ip": None,
-            "product_id": product_id,
-            "region": region,
-        })
-
-        inst = vps_client.wait_for_instance_ready(instance_id)
-        ip = inst.get("ip")
-
-        # Blocklist gate — Spamhaus Zen, Barracuda, SpamCop
-        listed = blocklist.check_ip(ip)
-        if not listed:
-            break
-
-        # Dirty IP: record, destroy, and loop to reprovision
-        click.echo(f"  IP {ip} listed on {', '.join(listed)} — destroying and retrying ({attempt}/{max_attempts})")
-        blocked_ips_tried.append({"ip": ip, "listed_on": listed})
-        state.set("blocked_ips_tried", blocked_ips_tried)
+    if not instance_id:
         try:
-            vps_client.destroy_instance(instance_id)
-        except Exception as exc:
-            click.echo(f"  warning: destroy failed for {instance_id}: {exc}")
-        instance_id = None
-        ip = None
-    else:
-        # Loop exited without break = all attempts blocklisted
-        summary = "\n".join(
-            f"  - {t['ip']} ({', '.join(t['listed_on'])})" for t in blocked_ips_tried
-        )
-        raise click.ClickException(
-            f"All {max_attempts} provisioned {provider} IPs were on a DNSBL:\n{summary}\n"
-            f"{provider}'s IP pool may be hot right now; try a different region or retry later."
-        )
+            inst = vps_client.create_instance(
+                display_name=display_name,
+                product_id=product_id,
+                region=region,
+                ssh_key_id=ssh_key_id,
+                image_id=image_id,
+            )
+        except requests.HTTPError as exc:
+            body = exc.response.text if exc.response is not None else str(exc)
+            if provider == "contabo" and ("not available" in body.lower() or "productid" in body.lower()):
+                raise click.ClickException(
+                    f"Contabo rejected product '{product_id}' in region '{region}': {body}\n"
+                    f"Contabo does not expose a list-products API — pick a current productId from\n"
+                    f"  https://contabo.com/en/vps/  (current range is roughly V91 through V107)\n"
+                    f"and set CONTABO_PRODUCT_ID=<id> in .env (or pass --product-id <id>), then re-run."
+                )
+            raise
+        instance_id = inst["id"]
+
+    # Save state immediately so a crash mid-wait doesn't lose track of the instance
+    state.set("vps", {
+        "provider": provider,
+        "id": instance_id,
+        "ip": None,
+        "product_id": product_id,
+        "region": region,
+    })
+
+    inst = vps_client.wait_for_instance_ready(instance_id)
+    ip = inst.get("ip")
+
+    # Fire-and-forget blocklist check via external webhook.
+    # The operator gets notified if the IP is listed; deploy continues regardless.
+    blocklist.notify_check_ip(ip)
+    click.echo(f"  Blocklist check triggered for {ip} (async — you'll be notified if listed)")
 
     # Create a sudoer shell user on the VM with our SSH key attached.
     # No-op on Contabo (admin preconfigured at provision); on Webdock the
@@ -221,7 +196,7 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
     # (Webdock's passwordlessSudo setting is dashboard-only, not an API field).
     ssh_credentials = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
 
-    # Clean IP obtained; persist final state
+    # Persist final state
     state.set("vps", {
         "provider": provider,
         "id": instance_id,
@@ -233,8 +208,6 @@ def _step_provision_vps(state: ShardState, domain: str, provider: str, product_i
         # step. Cleared from state immediately after bootstrap succeeds.
         "ssh_bootstrap_password": ssh_credentials.get("password"),
     })
-    if blocked_ips_tried:
-        click.echo(f"  Clean IP {ip} obtained after {len(blocked_ips_tried)} blocklisted retries")
     vps_client.wait_for_ssh(ip)
     state.mark_step_done("provision_vps")
 

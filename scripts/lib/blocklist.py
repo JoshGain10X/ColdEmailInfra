@@ -1,47 +1,26 @@
 from __future__ import annotations
 
-import dns.resolver
+import requests
+
+_BLOCKLIST_WEBHOOK = (
+    "https://n8n.10xmanagers.com/webhook/"
+    "5876c957-402a-4e87-a2c5-66de112640af"
+)
 
 
-# Spamhaus Zen aggregates SBL, XBL, PBL, CSS — the primary list Gmail/Microsoft consult.
-# Barracuda and SpamCop are secondary but widely honoured.
-DNSBLS = [
-    "zen.spamhaus.org",
-    "b.barracudacentral.org",
-    "bl.spamcop.net",
-]
+def notify_check_ip(ip: str) -> None:
+    """Fire-and-forget blocklist check via external n8n webhook.
 
-# Spamhaus Zen return codes we should IGNORE:
-#   127.0.0.10    = PBL (ISP policy block — normal for VPS IPs)
-#   127.0.0.11    = PBL (ISP maintained)
-#   127.255.255.254 = "query via public resolver" — not a real listing;
-#                     Spamhaus returns this when queried through shared/public
-#                     DNS resolvers (8.8.8.8, 1.1.1.1, etc.) instead of a
-#                     dedicated recursive resolver.
-#   127.255.255.255 = "query rate limited" — also not a real listing.
-_SPAMHAUS_IGNORE = {"127.0.0.10", "127.0.0.11", "127.255.255.254", "127.255.255.255"}
-
-
-def check_ip(ip: str) -> list[str]:
-    """Return DNSBL zones that have this IP listed. Empty list = clean.
-
-    Spamhaus PBL (Policy Block List) results are ignored — VPS IPs are
-    commonly in the PBL, which is expected and doesn't indicate spam activity.
+    The webhook triggers an async workflow that sends a notification if the
+    IP is blocklisted. The deploy continues regardless — if a problem is
+    found the operator will be notified and can manually intervene.
     """
-    reversed_ip = ".".join(reversed(ip.split(".")))
-    listed: list[str] = []
-    for zone in DNSBLS:
-        try:
-            answers = dns.resolver.resolve(f"{reversed_ip}.{zone}", "A", lifetime=5)
-            if zone == "zen.spamhaus.org":
-                # Filter out PBL-only results
-                codes = {rdata.address for rdata in answers}
-                if codes - _SPAMHAUS_IGNORE:
-                    # Has non-PBL listings (SBL/XBL/CSS) — genuinely blocklisted
-                    listed.append(zone)
-                # else: PBL-only, ignore
-            else:
-                listed.append(zone)
-        except Exception:
-            pass  # NXDOMAIN / timeout / no answer all = not listed
-    return listed
+    try:
+        requests.post(
+            _BLOCKLIST_WEBHOOK,
+            json={"domain": ip},
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception:
+        pass  # Best-effort; don't block deploy on webhook failure
