@@ -100,6 +100,32 @@ class CloudflareClient:
                 return None
             raise
 
+    # Cloudflare Registrar at-cost prices (USD/year). Source: cloudflare.com/products/registrar/
+    CLOUDFLARE_TLD_PRICES = {
+        "com": "$8.57", "net": "$10.67", "org": "$9.93",
+        "co.uk": "$5.98", "uk": "$5.98", "org.uk": "$5.98",
+        "io": "$33.98", "co": "$11.85", "dev": "$10.90",
+        "app": "$14.00", "xyz": "$8.57", "info": "$9.08",
+        "me": "$7.73", "biz": "$9.08", "us": "$6.50",
+        "cc": "$9.98", "tv": "$27.98", "de": "$5.91",
+        "nl": "$6.38", "eu": "$5.13", "fr": "$7.51",
+        "ca": "$11.50", "com.au": "$10.95", "in": "$7.73",
+    }
+
+    @staticmethod
+    def _tld_price(domain: str) -> str | None:
+        """Look up the at-cost price for a domain's TLD."""
+        parts = domain.rsplit(".", 1)
+        if len(parts) < 2:
+            return None
+        # Try multi-part TLD first (e.g. co.uk, org.uk, com.au)
+        dot_parts = domain.split(".")
+        for i in range(1, len(dot_parts)):
+            tld = ".".join(dot_parts[i:])
+            if tld in CloudflareClient.CLOUDFLARE_TLD_PRICES:
+                return CloudflareClient.CLOUDFLARE_TLD_PRICES[tld]
+        return None
+
     def registrar_check_availability(self, domain: str) -> dict:
         """Check if a domain is available for registration via Cloudflare Registrar.
 
@@ -122,12 +148,17 @@ class CloudflareClient:
 
         # Minimal response (just name + supported_tld) means CF doesn't own it.
         # It could be available or registered elsewhere. Do a quick RDAP check.
+        price = self._tld_price(domain)
         available = self._rdap_check_available(domain)
         if available is None:
-            # RDAP inconclusive — optimistically say available, registration will fail if not
-            return {"available": True, "price": "at cost (Cloudflare Registrar)", "note": "Availability not fully confirmed — purchase will fail if already taken"}
+            return {
+                "available": True,
+                "price": price,
+                "price_unknown": price is None,
+                "note": "Availability not fully confirmed — purchase will fail if already taken",
+            }
         elif available:
-            return {"available": True, "price": "at cost (Cloudflare Registrar)"}
+            return {"available": True, "price": price, "price_unknown": price is None}
         else:
             return {"available": False, "reason": "Domain is already registered"}
 
