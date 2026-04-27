@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+
 import requests
 
-_BLOCKLIST_WEBHOOK = (
+_BLOCKLIST_WEBHOOK = os.environ.get(
+    "BLOCKLIST_WEBHOOK_URL",
     "https://n8n.10xmanagers.com/webhook/"
-    "5876c957-402a-4e87-a2c5-66de112640af"
+    "5876c957-402a-4e87-a2c5-66de112640af",
 )
 
 

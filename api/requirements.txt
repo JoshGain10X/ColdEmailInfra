@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+supabase>=2.0
+python-dotenv>=1.0
+pydantic>=2.0
+# Also needs the parent project's deps (installed in same venv):
+# cloudflare, requests, paramiko, click, dnspython, webdock, jinja2
