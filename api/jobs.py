@@ -755,3 +755,69 @@ def run_domain_sync(job_id: str) -> None:
     except Exception as exc:
         _append_log(sb, job_id, f"FAILED: {exc}")
         _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# DOMAIN REGISTER
+# ---------------------------------------------------------------------------
+
+def run_domain_register(job_id: str, domain: str) -> None:
+    """Register a domain via Cloudflare Registrar and add to infra_domains."""
+    load_dotenv(override=True)
+    sb = _supabase()
+    _update_job(sb, job_id, status="running")
+
+    try:
+        cf = CloudflareClient()
+
+        # Step 1: Check availability
+        _append_log(sb, job_id, f"Checking availability of {domain}", step=1)
+        avail = cf.registrar_check_availability(domain)
+        if not avail.get("available"):
+            raise RuntimeError(
+                f"Domain {domain} is not available for registration. "
+                f"Status: {avail.get('status', 'unknown')}"
+            )
+        price = avail.get("price") or avail.get("renewal_price") or "unknown"
+        _append_log(sb, job_id, f"Available. Price: {price}/year")
+
+        # Step 2: Register
+        _append_log(sb, job_id, f"Registering {domain} via Cloudflare Registrar", step=2)
+        reg_info = cf.registrar_register(domain, years=1, privacy=True)
+        _append_log(sb, job_id, "Registration submitted, waiting for activation")
+
+        # Step 3: Wait for zone + insert into infra_domains
+        _append_log(sb, job_id, "Waiting for zone to appear", step=3)
+        zone_id = cf.wait_for_zone(domain, timeout=600)
+
+        # Get zone details
+        zone_info = cf._request("GET", f"/zones/{zone_id}")
+        zone = zone_info.get("result", {})
+
+        row = {
+            "domain": domain,
+            "zone_id": zone_id,
+            "zone_status": zone.get("status", "pending"),
+            "name_servers": zone.get("name_servers", []),
+            "zone_created_on": zone.get("created_on"),
+            "registrar_created_at": (
+                reg_info.get("created_at")
+                or reg_info.get("registered_at")
+                or datetime.now(timezone.utc).isoformat()
+            ),
+            "registrar_status": reg_info.get("status", "active"),
+            "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        existing_row = sb.table("infra_domains").select("id").eq("domain", domain).execute()
+        if existing_row.data:
+            sb.table("infra_domains").update(row).eq("domain", domain).execute()
+        else:
+            sb.table("infra_domains").insert(row).execute()
+
+        _append_log(sb, job_id, f"Domain {domain} registered and synced (zone={zone_id})", step=4)
+        _complete_job(sb, job_id)
+
+    except Exception as exc:
+        _append_log(sb, job_id, f"FAILED: {exc}")
+        _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")

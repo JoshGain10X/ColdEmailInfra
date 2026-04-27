@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from supabase import create_client
 
 from auth import verify_api_key
-from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync
+from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync, run_domain_register
 
 load_dotenv(override=True)
 
@@ -74,6 +74,11 @@ class LoadToBisonRequest(BaseModel):
 
 
 class ActionRequest(BaseModel):
+    created_by: Optional[str] = None
+
+
+class RegisterDomainRequest(BaseModel):
+    domain: str
     created_by: Optional[str] = None
 
 
@@ -192,6 +197,37 @@ def refresh_domains(bg: BackgroundTasks, req: Optional[ActionRequest] = None, _:
     job_id = _create_job("domain_sync", "all", total_steps=3, created_by=created_by)
     bg.add_task(run_domain_sync, job_id)
     return {"job_id": job_id, "status": "pending"}
+
+
+@app.post("/api/domains/check")
+def check_domain(req: RegisterDomainRequest, _: str = Depends(verify_api_key)):
+    """Check if a domain is available for registration via Cloudflare Registrar."""
+    from lib.cloudflare import CloudflareClient
+    cf = CloudflareClient()
+
+    # First check if we already own it
+    zone_id = cf.get_zone_id(req.domain)
+    if zone_id:
+        return {"domain": req.domain, "available": False, "reason": "Already on your Cloudflare account"}
+
+    try:
+        avail = cf.registrar_check_availability(req.domain)
+        return {
+            "domain": req.domain,
+            "available": avail.get("available", False),
+            "price": avail.get("price") or avail.get("renewal_price"),
+            "status": avail.get("status"),
+        }
+    except Exception as exc:
+        raise HTTPException(400, f"Availability check failed: {exc}")
+
+
+@app.post("/api/domains/register")
+def register_domain(req: RegisterDomainRequest, bg: BackgroundTasks, _: str = Depends(verify_api_key)):
+    """Register a domain via Cloudflare Registrar. Returns a job ID for tracking."""
+    job_id = _create_job("domain_register", req.domain, total_steps=4, created_by=req.created_by)
+    bg.add_task(run_domain_register, job_id, req.domain)
+    return {"job_id": job_id, "domain": req.domain, "status": "pending"}
 
 
 @app.get("/api/health")
