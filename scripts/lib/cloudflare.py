@@ -101,14 +101,70 @@ class CloudflareClient:
             raise
 
     def registrar_check_availability(self, domain: str) -> dict:
-        """Return availability + pricing. Endpoint shape follows the 2026 Registrar API beta."""
-        body = self._request("GET", self._registrar_path(f"/domains/{domain}/availability"))
-        return body.get("result", {})
+        """Check if a domain is available for registration via Cloudflare Registrar.
+
+        Uses GET /registrar/domains/{domain} — owned domains return full info
+        (current_registrar, available=False), unowned return just name + supported_tld.
+        """
+        body = self._request("GET", self._registrar_path(f"/domains/{domain}"))
+        result = body.get("result", {})
+
+        if not result.get("supported_tld"):
+            return {"available": False, "reason": "TLD not supported by Cloudflare Registrar"}
+
+        # If current_registrar is set, it's already registered (either by us or transferred in)
+        if result.get("current_registrar"):
+            return {"available": False, "reason": f"Already registered (registrar: {result['current_registrar']})"}
+
+        # If 'available' field is explicitly False (owned domain that can't be re-registered)
+        if "available" in result and not result["available"]:
+            return {"available": False, "reason": "Domain is not available"}
+
+        # Minimal response (just name + supported_tld) means CF doesn't own it.
+        # It could be available or registered elsewhere. Do a quick RDAP check.
+        available = self._rdap_check_available(domain)
+        if available is None:
+            # RDAP inconclusive — optimistically say available, registration will fail if not
+            return {"available": True, "price": "at cost (Cloudflare Registrar)", "note": "Availability not fully confirmed — purchase will fail if already taken"}
+        elif available:
+            return {"available": True, "price": "at cost (Cloudflare Registrar)"}
+        else:
+            return {"available": False, "reason": "Domain is already registered"}
+
+    @staticmethod
+    def _rdap_check_available(domain: str) -> bool | None:
+        """Quick RDAP lookup. Returns True=available, False=taken, None=inconclusive."""
+        import requests as _req
+        # RDAP bootstrap: try the IANA bootstrap for the TLD
+        rdap_servers = {
+            "com": "https://rdap.verisign.com/com/v1",
+            "net": "https://rdap.verisign.com/net/v1",
+            "org": "https://rdap.publicinterestregistry.org/rdap",
+            "io": "https://rdap.nic.io/rdap",
+            "co": "https://rdap.nic.co/rdap",
+            "uk": "https://rdap.nominet.uk/uk",
+            "co.uk": "https://rdap.nominet.uk/uk",
+        }
+        # Find matching RDAP server (try most specific first)
+        parts = domain.split(".", 1)
+        tld = parts[1] if len(parts) > 1 else parts[0]
+        server = rdap_servers.get(tld) or rdap_servers.get(tld.split(".")[-1])
+        if not server:
+            return None  # No known RDAP server for this TLD
+        try:
+            resp = _req.get(f"{server}/domain/{domain}", timeout=8)
+            if resp.status_code == 200:
+                return False  # Domain found = taken
+            elif resp.status_code == 404:
+                return True  # Not found = available
+            return None
+        except Exception:
+            return None
 
     def registrar_register(self, domain: str, years: int = 1, privacy: bool = True) -> dict:
         """Register a new domain via Cloudflare Registrar. Blocks until registration is final."""
         payload = {
-            "name": domain,
+            "domain_name": domain,
             "period": years,
             "privacy": privacy,
         }
