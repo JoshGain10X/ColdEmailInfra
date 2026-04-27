@@ -676,7 +676,21 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
                        body={"tag_ids": [tag_id], "sender_email_ids": created_ids, "skip_webhooks": True})
                 _append_log(sb, job_id, f"Tagged {len(created_ids)} senders")
 
-        _upsert_shard(sb, domain, bison_loaded=True, bison_workspace=ws_name)
+        # Upload CSV to Supabase Storage for CRM download
+        storage_path = f"{domain}.csv"
+        try:
+            with open(csv_file, "rb") as fh:
+                sb.storage.from_("shard-csvs").upload(
+                    storage_path, fh.read(),
+                    file_options={"content-type": "text/csv", "upsert": "true"},
+                )
+        except Exception as upload_exc:
+            _append_log(sb, job_id, f"CSV upload warning: {upload_exc}")
+            storage_path = None
+
+        _upsert_shard(sb, domain, bison_loaded=True, bison_workspace=ws_name,
+                      bison_loaded_at=datetime.now(timezone.utc).isoformat(),
+                      csv_storage_path=storage_path)
         _append_log(sb, job_id, f"Done: {len(created_ids)} senders loaded to {ws_name}", step=6)
         _complete_job(sb, job_id)
 

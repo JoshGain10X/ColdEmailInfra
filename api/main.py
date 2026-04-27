@@ -10,6 +10,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from supabase import create_client
 
@@ -156,6 +157,20 @@ def get_shard(domain: str, _: str = Depends(verify_api_key)):
     if not result.data:
         raise HTTPException(404, f"Shard {domain} not found")
     return {"shard": result.data[0]}
+
+
+@app.get("/api/shards/{domain}/csv")
+def download_shard_csv(domain: str, _: str = Depends(verify_api_key)):
+    """Generate a signed URL for the shard's CSV and return it."""
+    sb = _sb()
+    result = sb.table("infra_shards").select("csv_storage_path").eq("domain", domain).execute()
+    if not result.data or not result.data[0].get("csv_storage_path"):
+        raise HTTPException(404, f"No CSV found for shard {domain}")
+    path = result.data[0]["csv_storage_path"]
+    signed = sb.storage.from_("shard-csvs").create_signed_url(path, 300)
+    if not signed or not signed.get("signedURL"):
+        raise HTTPException(500, "Failed to generate download URL")
+    return {"url": signed["signedURL"], "filename": f"{domain}_bison.csv"}
 
 
 @app.get("/api/jobs")
