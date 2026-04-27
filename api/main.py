@@ -212,12 +212,11 @@ def check_domain(req: RegisterDomainRequest, _: str = Depends(verify_api_key)):
 
     try:
         avail = cf.registrar_check_availability(req.domain)
-        return {
-            "domain": req.domain,
-            "available": avail.get("available", False),
-            "price": avail.get("price") or avail.get("renewal_price"),
-            "status": avail.get("status"),
-        }
+        result = {"domain": req.domain, "available": avail.get("available", False)}
+        for key in ("price", "price_unknown", "reason", "note"):
+            if key in avail:
+                result[key] = avail[key]
+        return result
     except Exception as exc:
         raise HTTPException(400, f"Availability check failed: {exc}")
 
