@@ -124,6 +124,23 @@ class CloudflareClient:
         raise TimeoutError(f"Domain {domain} did not become active within 10 minutes (last result: {result})")
 
     # ------------------------------------------------------------------
+    # Zone listing
+    # ------------------------------------------------------------------
+
+    def list_zones(self) -> list[dict]:
+        """Return all zones on the account (paginated)."""
+        results: list[dict] = []
+        page = 1
+        while True:
+            body = self._request("GET", "/zones", params={"per_page": 50, "page": page})
+            results.extend(body.get("result", []))
+            info = body.get("result_info", {})
+            if page >= info.get("total_pages", 1):
+                break
+            page += 1
+        return results
+
+    # ------------------------------------------------------------------
     # DNS records
     # ------------------------------------------------------------------
 
