@@ -565,8 +565,47 @@ def run_verify(job_id: str, domain: str) -> None:
 # LOAD TO BISON
 # ---------------------------------------------------------------------------
 
+def _generate_signature(first: str, last: str, email: str, company: str) -> str:
+    """Generate a randomised plain-text email signature for deliverability."""
+    import random
+
+    templates = [
+        f"{first} {last}",
+        f"{first} {last} | {company}",
+        f"{first} {last}\n{company}",
+        f"{first} {last}\n{email}",
+        f"{first} {last} | {company}\n{email}",
+        f"{first} {last}\n{company}\n{email}",
+        f"{first} {last} - {company}",
+        f"{email}",
+        f"{first} {last}, {company}",
+        f"{first}\n{company}",
+        f"{first} {last} | {email}",
+        f"{first} from {company}",
+        f"Best,\n{first} {last}",
+        f"Thanks,\n{first}",
+        f"Cheers,\n{first} {last}\n{company}",
+        f"{first} {last}\n{company} Team",
+    ]
+    sig = random.choice(templates)
+
+    # ~10% chance of a mobile send tag
+    if random.random() < 0.10:
+        mobile_tags = [
+            "Sent from my iPhone",
+            "Sent from my mobile",
+            "Sent from mobile",
+        ]
+        sig += f"\n\n{random.choice(mobile_tags)}"
+
+    return sig
+
+
 def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, tag: str = "Custom SMTP") -> None:
-    """Bulk-upload shard mailboxes to Bison — called as a background task."""
+    """Create shard mailboxes individually in Bison with unique signatures."""
+    import random
+    import time as _time
+
     load_dotenv(override=True)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
@@ -576,107 +615,143 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
         if not csv_file.exists():
             raise RuntimeError(f"CSV not found at {csv_file}. Run deploy first.")
 
-        tokens_raw = os.environ.get("BISON_API_TOKENS", "").strip()
-        if not tokens_raw:
-            raise RuntimeError("BISON_API_TOKENS not set")
-        tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
         base_url = os.environ.get("BISON_API_BASE", "https://send.spamproofed.com").rstrip("/")
 
-        # Import the curl helper from load_to_bison
-        # We re-implement minimally here to avoid Click dependency
-        import subprocess
+        # --- Token resolution: DB-first, env-var fallback ---
+        _append_log(sb, job_id, "Resolving workspace token", step=1)
 
-        _CURL_SENTINEL = "<<<BISON_HTTP_CODE>>>"
+        chosen_token = None
+        ws_name = workspace or "?"
 
-        def _curl(method, path, token, body=None, form=None):
-            cmd = [
-                "curl", "-s", "-X", method, f"{base_url}{path}",
-                "-H", f"Authorization: Bearer {token}",
-                "-H", "Accept: application/json",
-                "-w", f"\n{_CURL_SENTINEL}%{{http_code}}",
-            ]
-            if body is not None:
-                cmd += ["-H", "Content-Type: application/json",
-                        "-d", json.dumps(body, separators=(",", ":"))]
-            if form is not None:
-                for f in form:
-                    cmd += ["-F", f]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            output = result.stdout or ""
-            if _CURL_SENTINEL not in output:
-                return 0, {"error": f"curl no sentinel; raw={output[:400]}"}
-            body_str, code_str = output.rsplit(_CURL_SENTINEL, 1)
-            try:
-                status = int(code_str.strip())
-            except ValueError:
-                status = 0
-            body_str = body_str.strip()
-            try:
-                parsed = json.loads(body_str) if body_str else {}
-            except json.JSONDecodeError:
-                parsed = {"raw": body_str[:500]}
-            return status, parsed
-
-        # Discover workspaces
-        _append_log(sb, job_id, "Discovering Bison workspaces", step=1)
-        usable = []
-        for tok in tokens:
-            status_code, body = _curl("GET", "/api/workspaces/v1.1", tok)
-            if status_code != 200:
-                continue
-            workspaces = body.get("data") or []
-            if len(workspaces) == 1:
-                usable.append((tok, workspaces[0]))
-
-        if not usable:
-            raise RuntimeError("No usable per-workspace tokens found")
-
+        # Try bison_workspaces table first
         if workspace:
-            matches = [(tok, ws) for tok, ws in usable if ws.get("name") == workspace]
-            if not matches:
-                available = [ws.get("name") for _, ws in usable]
-                raise RuntimeError(f"Workspace {workspace!r} not found. Available: {available}")
-            chosen_token, chosen_ws = matches[0]
+            db_result = sb.table("bison_workspaces").select(
+                "api_key, workspace_name"
+            ).eq("workspace_name", workspace).execute()
+            if db_result.data:
+                chosen_token = db_result.data[0]["api_key"]
+                ws_name = db_result.data[0]["workspace_name"]
         else:
-            chosen_token, chosen_ws = usable[0]
+            # No workspace specified — use default from DB
+            db_result = sb.table("bison_workspaces").select(
+                "api_key, workspace_name"
+            ).eq("is_default", True).execute()
+            if db_result.data:
+                chosen_token = db_result.data[0]["api_key"]
+                ws_name = db_result.data[0]["workspace_name"]
 
-        ws_name = chosen_ws.get("name", "?")
+        # Fallback to BISON_API_TOKENS env var
+        if not chosen_token:
+            tokens_raw = os.environ.get("BISON_API_TOKENS", "").strip()
+            if not tokens_raw:
+                raise RuntimeError("No Bison workspace configured and BISON_API_TOKENS not set")
+            tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
+
+            from lib.bison_api import BisonClient
+            for tok in tokens:
+                try:
+                    client = BisonClient(tok, base_url)
+                    wss = client.get_workspaces()
+                    if len(wss) == 1:
+                        ws_info = wss[0]
+                        if workspace and ws_info.get("name") != workspace:
+                            continue
+                        chosen_token = tok
+                        ws_name = ws_info.get("name", "?")
+                        break
+                except Exception:
+                    continue
+
+        if not chosen_token:
+            raise RuntimeError(f"Could not resolve token for workspace {workspace!r}")
+
         _append_log(sb, job_id, f"Target workspace: {ws_name}", step=2)
 
-        # Upload CSV
-        _append_log(sb, job_id, "Uploading CSV to Bison", step=3)
-        status_code, body = _curl(
-            "POST", "/api/sender-emails/bulk", chosen_token,
-            form=[f"csv=@{csv_file}"],
-        )
-        if status_code not in (200, 201):
-            raise RuntimeError(f"Bulk upload failed: HTTP {status_code}: {json.dumps(body)[:500]}")
+        # Company name: ReachOS workspace → "ReachOS", everything else → "10X Managers"
+        company = "ReachOS" if ws_name == "ReachOS" else "10X Managers"
 
-        created = body.get("data") or []
-        created_ids = [s.get("id") for s in created if s.get("id")]
-        _append_log(sb, job_id, f"Uploaded {len(created_ids)} senders", step=4)
+        # --- Read CSV rows ---
+        rows = []
+        with csv_file.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                rows.append(row)
 
+        if not rows:
+            raise RuntimeError(f"CSV is empty: {csv_file}")
+
+        _append_log(sb, job_id, f"Creating {len(rows)} senders individually with signatures", step=3)
+
+        # --- Create each sender individually with signature ---
+        from lib.bison_api import BisonClient
+        client = BisonClient(chosen_token, base_url)
+        created_ids = []
+        failed = 0
+
+        for i, row in enumerate(rows, 1):
+            name = row.get("Name", "")
+            email_addr = row.get("Email", "")
+            password = row.get("Password", "")
+            imap_server = row.get("IMAP Server", "")
+            imap_port = int(row.get("IMAP Port", "993"))
+            smtp_server = row.get("SMTP Server", "")
+            smtp_port = int(row.get("SMTP Port", "465"))
+            daily_limit = int(row.get("Daily Limit", "10"))
+
+            # Parse first/last from Name column
+            parts = name.strip().split(" ", 1)
+            first = parts[0] if parts else "Team"
+            last = parts[1] if len(parts) > 1 else ""
+
+            signature = _generate_signature(first, last, email_addr, company)
+
+            payload = {
+                "name": name,
+                "email": email_addr,
+                "password": password,
+                "imap_server": imap_server,
+                "imap_port": imap_port,
+                "smtp_server": smtp_server,
+                "smtp_port": smtp_port,
+                "imap_secure": True,
+                "smtp_secure": True,
+                "daily_limit": daily_limit,
+                "email_signature": signature,
+            }
+
+            try:
+                result = client.create_sender_imap_smtp(payload)
+                sender_id = result.get("id")
+                if sender_id:
+                    created_ids.append(sender_id)
+            except Exception as exc:
+                failed += 1
+                if i <= 3 or failed <= 3:
+                    _append_log(sb, job_id, f"Failed sender {email_addr}: {exc}")
+
+            # Log progress every 5 senders
+            if i % 5 == 0 or i == len(rows):
+                _append_log(sb, job_id, f"Created {i}/{len(rows)} senders ({failed} failed)")
+
+            # Small delay between calls to avoid rate limiting
+            if i < len(rows):
+                _time.sleep(0.5)
+
+        _append_log(sb, job_id, f"Created {len(created_ids)}/{len(rows)} senders", step=4)
+
+        # --- Tag all created senders ---
         if created_ids:
-            # Resolve/create tag
             _append_log(sb, job_id, f"Attaching tag '{tag}'", step=5)
-            tag_status, tag_body = _curl("GET", "/api/tags", chosen_token)
-            tag_id = None
-            if tag_status == 200:
-                for t in tag_body.get("data") or []:
-                    if t.get("name") == tag:
-                        tag_id = t.get("id")
-                        break
-            if tag_id is None:
-                tag_status, tag_body = _curl("POST", "/api/tags", chosen_token, body={"name": tag})
-                if tag_status in (200, 201):
-                    tag_id = (tag_body.get("data") or {}).get("id")
+            try:
+                tag_obj = client.find_or_create_tag(tag)
+                tag_id = tag_obj.get("id")
+                if tag_id:
+                    client.attach_tag_to_senders(tag_id, created_ids)
+                    _append_log(sb, job_id, f"Tagged {len(created_ids)} senders")
+            except Exception as tag_exc:
+                _append_log(sb, job_id, f"Tag attach warning: {tag_exc}")
 
-            if tag_id:
-                _curl("POST", "/api/tags/attach-to-sender-emails", chosen_token,
-                       body={"tag_ids": [tag_id], "sender_email_ids": created_ids, "skip_webhooks": True})
-                _append_log(sb, job_id, f"Tagged {len(created_ids)} senders")
-
-        # Upload CSV to Supabase Storage for CRM download
+        # --- Upload CSV to Supabase Storage for CRM download ---
         storage_path = f"{domain}.csv"
         try:
             with open(csv_file, "rb") as fh:
