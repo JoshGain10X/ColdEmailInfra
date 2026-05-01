@@ -339,12 +339,28 @@ def run_deploy(
             state.mark_step_done("export_bison")
         _append_log(sb, job_id, "Bison CSV exported", step=9)
 
+        # Upload CSV to Supabase Storage (non-blocking)
+        csv_storage_path = None
+        try:
+            csv_file = SHARDS_DIR / f"{domain}_bison.csv"
+            storage_key = f"{domain}.csv"
+            with open(csv_file, "rb") as fh:
+                sb.storage.from_("shard-csvs").upload(
+                    storage_key, fh.read(),
+                    file_options={"content-type": "text/csv", "upsert": "true"},
+                )
+            csv_storage_path = storage_key
+            _append_log(sb, job_id, "CSV uploaded to storage")
+        except Exception as upload_exc:
+            _append_log(sb, job_id, f"CSV storage upload warning: {upload_exc}")
+
         # Update shard status
         step_flags = state.data.get("steps", {})
         _upsert_shard(sb, domain,
             status="active",
             mailbox_count=len(state.get("mailboxes", [])),
             step_flags=step_flags,
+            csv_storage_path=csv_storage_path,
         )
 
         _append_log(sb, job_id, "Deploy complete", step=10)
