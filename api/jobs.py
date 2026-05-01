@@ -128,7 +128,7 @@ def run_deploy(
     product_id: str,
     region: str,
     image_id: str,
-    ssl_type: str = "self-signed",
+    ssl_type: str = "letsencrypt",
 ) -> None:
     """Full shard deployment — called as a background task."""
     load_dotenv(override=True)

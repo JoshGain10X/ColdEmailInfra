@@ -64,7 +64,7 @@ class DeployRequest(BaseModel):
     product_id: Optional[str] = None
     region: Optional[str] = None
     image_id: Optional[str] = None
-    ssl_type: str = "self-signed"
+    ssl_type: str = "letsencrypt"
     created_by: Optional[str] = None
 
 
@@ -81,6 +81,10 @@ class ActionRequest(BaseModel):
 class RegisterDomainRequest(BaseModel):
     domain: str
     created_by: Optional[str] = None
+
+
+class AddBisonWorkspaceRequest(BaseModel):
+    api_key: str
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +246,90 @@ def register_domain(req: RegisterDomainRequest, bg: BackgroundTasks, _: str = De
     job_id = _create_job("domain_register", req.domain, total_steps=4, created_by=req.created_by)
     bg.add_task(run_domain_register, job_id, req.domain)
     return {"job_id": job_id, "domain": req.domain, "status": "pending"}
+
+
+# ---------------------------------------------------------------------------
+# Bison Workspace Management
+# ---------------------------------------------------------------------------
+
+@app.get("/api/bison/workspaces")
+def list_bison_workspaces(_: str = Depends(verify_api_key)):
+    """List configured Bison workspaces (never returns API keys)."""
+    sb = _sb()
+    result = sb.table("bison_workspaces").select(
+        "id, workspace_name, workspace_id, is_default, created_at"
+    ).order("created_at").execute()
+    return {"workspaces": result.data}
+
+
+@app.post("/api/bison/workspaces")
+def add_bison_workspace(req: AddBisonWorkspaceRequest, _: str = Depends(verify_api_key)):
+    """Add a Bison workspace by API key. Validates the key against Bison API."""
+    import subprocess
+    import json as _json
+
+    base_url = os.environ.get("BISON_API_BASE", "https://send.spamproofed.com").rstrip("/")
+    cmd = [
+        "curl", "-s", "-X", "GET", f"{base_url}/api/workspaces/v1.1",
+        "-H", f"Authorization: Bearer {req.api_key}",
+        "-H", "Accept: application/json",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        body = _json.loads(result.stdout)
+    except Exception:
+        raise HTTPException(400, "Invalid response from Bison API — check the key")
+
+    workspaces = body.get("data") or []
+    if len(workspaces) == 0:
+        raise HTTPException(400, "API key returned no workspaces — invalid key")
+    if len(workspaces) > 1:
+        raise HTTPException(400, "This is a super-admin key (multiple workspaces). Use a per-workspace key.")
+
+    ws = workspaces[0]
+    ws_name = ws.get("name", "Unknown")
+    ws_id = ws.get("id") or ws.get("_id")
+
+    sb = _sb()
+    existing = sb.table("bison_workspaces").select("id").eq("workspace_name", ws_name).execute()
+    if existing.data:
+        raise HTTPException(409, f"Workspace '{ws_name}' already exists")
+
+    row = sb.table("bison_workspaces").insert({
+        "workspace_name": ws_name,
+        "workspace_id": str(ws_id) if ws_id else None,
+        "api_key": req.api_key,
+    }).execute()
+
+    return {"workspace": {
+        "id": row.data[0]["id"],
+        "workspace_name": ws_name,
+        "workspace_id": str(ws_id) if ws_id else None,
+        "is_default": False,
+    }}
+
+
+@app.delete("/api/bison/workspaces/{workspace_id}")
+def delete_bison_workspace(workspace_id: str, _: str = Depends(verify_api_key)):
+    """Remove a Bison workspace configuration."""
+    sb = _sb()
+    existing = sb.table("bison_workspaces").select("id").eq("id", workspace_id).execute()
+    if not existing.data:
+        raise HTTPException(404, "Workspace not found")
+    sb.table("bison_workspaces").delete().eq("id", workspace_id).execute()
+    return {"ok": True}
+
+
+@app.put("/api/bison/workspaces/{workspace_id}/default")
+def set_default_bison_workspace(workspace_id: str, _: str = Depends(verify_api_key)):
+    """Set a workspace as the default for Push to Bison."""
+    sb = _sb()
+    existing = sb.table("bison_workspaces").select("id").eq("id", workspace_id).execute()
+    if not existing.data:
+        raise HTTPException(404, "Workspace not found")
+    sb.table("bison_workspaces").update({"is_default": False}).eq("is_default", True).execute()
+    sb.table("bison_workspaces").update({"is_default": True}).eq("id", workspace_id).execute()
+    return {"ok": True}
 
 
 @app.get("/api/health")
