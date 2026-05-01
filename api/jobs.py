@@ -582,26 +582,26 @@ def run_verify(job_id: str, domain: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _generate_signature(first: str, last: str, email: str, company: str) -> str:
-    """Generate a randomised plain-text email signature for deliverability."""
+    """Generate a randomised HTML email signature for deliverability."""
     import random
 
     templates = [
-        f"{first} {last}",
-        f"{first} {last} | {company}",
-        f"{first} {last}\n{company}",
-        f"{first} {last}\n{email}",
-        f"{first} {last} | {company}\n{email}",
-        f"{first} {last}\n{company}\n{email}",
-        f"{first} {last} - {company}",
-        f"{email}",
-        f"{first} {last}, {company}",
-        f"{first}\n{company}",
-        f"{first} {last} | {email}",
-        f"{first} from {company}",
-        f"Best,\n{first} {last}",
-        f"Thanks,\n{first}",
-        f"Cheers,\n{first} {last}\n{company}",
-        f"{first} {last}\n{company} Team",
+        f"<p>{first} {last}</p>",
+        f"<p><strong>{first} {last}</strong> | {company}</p>",
+        f"<p>{first} {last}<br>{company}</p>",
+        f"<p>{first} {last}<br>{email}</p>",
+        f"<p><strong>{first} {last}</strong> | {company}<br>{email}</p>",
+        f"<p>{first} {last}<br>{company}<br>{email}</p>",
+        f"<p>{first} {last} - {company}</p>",
+        f"<p>{email}</p>",
+        f"<p>{first} {last}, {company}</p>",
+        f"<p>{first}<br>{company}</p>",
+        f"<p>{first} {last} | {email}</p>",
+        f"<p>{first} from {company}</p>",
+        f"<p>Best,<br>{first} {last}</p>",
+        f"<p>Thanks,<br>{first}</p>",
+        f"<p>Cheers,<br>{first} {last}<br>{company}</p>",
+        f"<p>{first} {last}<br>{company} Team</p>",
     ]
     sig = random.choice(templates)
 
@@ -612,7 +612,7 @@ def _generate_signature(first: str, last: str, email: str, company: str) -> str:
             "Sent from my mobile",
             "Sent from mobile",
         ]
-        sig += f"\n\n{random.choice(mobile_tags)}"
+        sig += f"<p style=\"font-size:12px;color:#888;\">{random.choice(mobile_tags)}</p>"
 
     return sig
 
