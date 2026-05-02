@@ -740,6 +740,19 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
                 sender_id = result.get("id")
                 if sender_id:
                     created_ids.append(sender_id)
+                    # Bison ignores email_signature on create — PATCH it after
+                    try:
+                        import requests as _requests
+                        _requests.patch(
+                            f"{base_url}/api/sender-emails/{sender_id}",
+                            headers={"Authorization": f"Bearer {chosen_token}",
+                                     "Accept": "application/json",
+                                     "Content-Type": "application/json"},
+                            json={"email_signature": signature, "daily_limit": daily_limit},
+                            timeout=15,
+                        )
+                    except Exception:
+                        pass  # Non-blocking — signature is nice-to-have
             except Exception as exc:
                 failed += 1
                 if i <= 3 or failed <= 3:
