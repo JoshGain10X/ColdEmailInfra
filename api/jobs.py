@@ -1081,7 +1081,7 @@ def run_domain_register(job_id: str, client_id: str, domain: str) -> None:
 
         # Step 3: Wait for zone + insert into infra_domains
         _append_log(sb, job_id, "Waiting for zone to appear", step=3)
-        zone_id = cf.wait_for_zone(domain, timeout=600)
+        zone_id = cf.wait_for_zone(domain, timeout=1200)
 
         # Get zone details
         zone_info = cf._request("GET", f"/zones/{zone_id}")
