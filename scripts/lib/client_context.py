@@ -243,6 +243,16 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
             format_variants=1,
         )
 
+    # Derive a host-like string for dmarc_rua/le_email defaults when not explicitly set.
+    # website_url may be NULL on the row — coerce via `or ''` before stripping.
+    website_host = (
+        (client_row.get("website_url") or "")
+        .replace("https://", "")
+        .replace("http://", "")
+        .rstrip("/")
+    )
+    default_email_host = website_host or client_row["slug"]
+
     return ClientContext(
         client_id=client_row["id"],
         slug=client_row["slug"],
@@ -254,8 +264,8 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         mailbox_count=int(settings.get("mailbox_count") or 100),
         subdomain_count=int(settings.get("subdomain_count") or 20),
         default_daily_limit=int(settings.get("default_daily_limit") or 10),
-        dmarc_rua=settings.get("dmarc_rua") or f"dmarc@{client_row.get('website_url','').replace('https://','').replace('http://','').rstrip('/') or client_row['slug']}",
-        le_email=settings.get("le_email") or f"ops@{client_row.get('website_url','').replace('https://','').replace('http://','').rstrip('/') or client_row['slug']}",
+        dmarc_rua=settings.get("dmarc_rua") or f"dmarc@{default_email_host}",
+        le_email=settings.get("le_email") or f"ops@{default_email_host}",
         ssl_type=settings.get("ssl_type") or "letsencrypt",
         cloudflare=cf,
         webdock=webdock,
