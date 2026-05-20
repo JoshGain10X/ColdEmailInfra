@@ -314,6 +314,85 @@ class MailserverClient:
         self._wait_for_container("mailserver")
         self.wait_for_mailserver_ready("mailserver")
 
+    def install_mta_sts(self, domain: str, mode: str = "testing", max_age: int = 86400) -> None:
+        """Install Caddy on this VPS and configure it to serve the MTA-STS
+        policy at https://mta-sts.<domain>/.well-known/mta-sts.txt.
+
+        MTA-STS (RFC 8461) lets us declare 'inbound mail to this domain
+        MUST use TLS'. Modern mailbox providers (Gmail, Outlook, Yahoo)
+        treat it as a sender-quality signal.
+
+        Caddy handles Let's Encrypt provisioning automatically. The
+        mta-sts.<domain> A record must resolve to this VPS *before*
+        this call runs — done in the configure_dns step earlier in deploy.
+
+        Starts at mode=testing for safety (policy violations are reported
+        via TLS-RPT but not enforced by receivers). Promote to mode=enforce
+        after 2-4 weeks of clean operation by re-running with mode='enforce'
+        or editing /etc/caddy/Caddyfile directly + `sudo systemctl reload caddy`.
+        """
+        # Install Caddy from the official repo (works on Ubuntu jammy/noble).
+        # apt-key step uses the cloudsmith-hosted gpg key.
+        install_script = (
+            "apt-get update && "
+            "apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg && "
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
+            "  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg && "
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
+            "  > /etc/apt/sources.list.d/caddy-stable.list && "
+            "apt-get update && "
+            "apt-get install -y caddy"
+        )
+        self.sudo(install_script)
+
+        policy_lines = [
+            "version: STSv1",
+            f"mode: {mode}",
+            f"mx: mail.{domain}",
+            f"max_age: {max_age}",
+        ]
+        policy_body = "\n".join(policy_lines) + "\n"
+
+        # Caddy block: serve the policy file on the canonical path,
+        # 404 everything else. Caddy auto-acquires + renews the LE cert
+        # for mta-sts.<domain>.
+        caddyfile = f"""# Managed by ColdEmailInfra — do not edit by hand.
+{{
+    email ops@{domain}
+}}
+
+mta-sts.{domain} {{
+    handle /.well-known/mta-sts.txt {{
+        header Content-Type "text/plain; charset=utf-8"
+        respond <<MTASTS
+{policy_body.rstrip()}
+MTASTS 200
+    }}
+    handle {{
+        respond "Not found" 404
+    }}
+}}
+"""
+        # Upload Caddyfile to /etc/caddy/Caddyfile (requires root)
+        self.upload_text(caddyfile, "/tmp/Caddyfile.new")
+        self.sudo("mv /tmp/Caddyfile.new /etc/caddy/Caddyfile")
+        self.sudo("chown root:root /etc/caddy/Caddyfile && chmod 644 /etc/caddy/Caddyfile")
+
+        # Start + enable
+        self.sudo("systemctl enable caddy")
+        self.sudo("systemctl restart caddy")
+
+        # Wait a few seconds and verify the policy is being served (LE cert
+        # provisioning can take ~10-20s; we don't block on cert here, just
+        # confirm Caddy is up).
+        time.sleep(3)
+        _, status, _ = self.sudo("systemctl is-active caddy", check=False)
+        if "active" not in status:
+            _, logs, _ = self.sudo("journalctl -u caddy --no-pager -n 30", check=False)
+            raise RuntimeError(
+                f"Caddy did not start. Status: {status.strip()}\nLast logs:\n{logs}"
+            )
+
     def _wait_for_container(self, name: str, timeout: int = 300) -> None:
         start = time.time()
         last_status = ""

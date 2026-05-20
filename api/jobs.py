@@ -314,6 +314,22 @@ def run_deploy(
                 zone_id, "TXT", f"_dmarc.{domain}",
                 f"v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
             )
+
+            # MTA-STS + TLS-RPT records.
+            # mta-sts.<domain> A → VPS IP (unproxied so Let's Encrypt ACME
+            # challenge can reach Caddy on port 80/443 during cert issuance).
+            # _mta-sts.<domain> TXT carries the policy version/id.
+            # _smtp._tls.<domain> TXT enables TLS reporting (RFC 8460).
+            cf.upsert_record(zone_id, "A", f"mta-sts.{domain}", vps_ip, proxied=False)
+            mta_sts_id = int(datetime.now(timezone.utc).timestamp())
+            cf.upsert_record(
+                zone_id, "TXT", f"_mta-sts.{domain}",
+                f"v=STSv1; id={mta_sts_id};",
+            )
+            cf.upsert_record(
+                zone_id, "TXT", f"_smtp._tls.{domain}",
+                f"v=TLSRPTv1; rua=mailto:tls-rpt@{domain}",
+            )
             for sub in subs:
                 fqdn = f"{sub}.{domain}"
                 sub_mail = f"mail.{fqdn}"
@@ -375,6 +391,21 @@ def run_deploy(
                 ms.close()
             state.mark_step_done("create_mailboxes")
         _append_log(sb, job_id, "Mailboxes created", step=7)
+
+        # Step 6.5: Install MTA-STS policy server (Caddy on the mail VPS)
+        # Runs after mailserver install + before DKIM so the policy URL is
+        # live before any outbound mail starts. Caddy auto-acquires the LE
+        # cert for mta-sts.<domain> — the DNS A record was set in step 5.
+        if not state.is_step_done("install_mta_sts"):
+            _append_log(sb, job_id, "Installing MTA-STS policy server (Caddy)")
+            ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
+            ms.connect()
+            try:
+                ms.install_mta_sts(domain, mode="testing")
+            finally:
+                ms.close()
+            state.mark_step_done("install_mta_sts")
+        _append_log(sb, job_id, "MTA-STS + TLS-RPT live")
 
         # Step 7: Setup DKIM
         if not state.is_step_done("setup_dkim"):
