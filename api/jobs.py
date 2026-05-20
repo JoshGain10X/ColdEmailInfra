@@ -206,19 +206,20 @@ def run_deploy(
         _append_log(sb, job_id, f"Domain ready, zone_id={zone_id}", step=1)
 
         # Step 1: Generate subdomains & mailboxes
-        # If the client has a single-persona mailbox pool configured
-        # (e.g. ReachOS, where every mailbox is "Josh Gain" under different
-        # local-part aliases), that takes precedence; otherwise default
-        # multi-persona generation from British name lists.
+        # Subdomain count is random 6-8 per shard, sampled from the client's
+        # subdomain_pool (NULL → legacy 20-item generic list).
+        # Per-subdomain mailbox count is random 5-15, summing to ctx.mailbox_count.
+        # Two shards from the same client never have an identical layout.
         if not state.is_step_done("generate"):
             _append_log(sb, job_id, "Generating subdomains and mailboxes")
-            subs = pick_subdomains(domain)
             seed = secrets.randbits(64)
+            subs = pick_subdomains(domain, seed=seed, pool=ctx.subdomain_pool)
             mailboxes = generate_mailboxes(
                 domain, subs, seed=seed,
                 local_parts=ctx.mailbox_local_parts,
                 display_first_name=ctx.mailbox_display_first_name,
                 display_last_name=ctx.mailbox_display_last_name,
+                mailbox_count_total=ctx.mailbox_count,
             )
             state.set("subdomains", subs)
             state.set("mailbox_seed", seed)
@@ -226,7 +227,8 @@ def run_deploy(
             state.mark_step_done("generate")
         mailbox_mode = "single-persona" if ctx.mailbox_local_parts else "multi-persona"
         _append_log(sb, job_id,
-            f"Generated {len(state.get('subdomains'))} subdomains, "
+            f"Generated {len(state.get('subdomains'))} subdomains "
+            f"({', '.join(state.get('subdomains'))}), "
             f"{len(state.get('mailboxes'))} mailboxes ({mailbox_mode})", step=2)
 
         # Step 2: Provision VPS
