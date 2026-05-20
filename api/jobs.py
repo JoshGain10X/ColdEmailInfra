@@ -181,8 +181,12 @@ def run_deploy(
                 "Add it to Vault and link via client_credentials before deploying."
             )
 
+        # Initial shard row — mailbox_count + bison_loaded get their real values
+        # later in the deploy. Pass mailbox_count up front to satisfy NOT NULL
+        # in case the column default isn't set on the target schema.
         _upsert_shard(sb, domain, client_id=client_id, status="deploying",
-                      provider=provider, region=region)
+                      provider=provider, region=region,
+                      mailbox_count=ctx.mailbox_count)
 
         state = ShardState(domain)
 
