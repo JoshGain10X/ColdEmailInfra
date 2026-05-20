@@ -144,25 +144,51 @@ def _ssh_user(state: ShardState) -> str:
 
 def run_deploy(
     job_id: str,
+    client_id: str,
     domain: str,
-    provider: str,
-    product_id: str,
-    region: str,
-    image_id: str,
-    ssl_type: str = "letsencrypt",
+    provider: str = "webdock",
+    product_id: str | None = None,
+    region: str | None = None,
+    image_id: str | None = None,
+    ssl_type: str | None = None,
 ) -> None:
-    """Full shard deployment — called as a background task."""
+    """Full shard deployment — called as a background task.
+
+    Multi-tenant: client_id is required. Webdock + Cloudflare credentials,
+    redirect URL, DMARC RUA, LE email, mailbox count, subdomain count,
+    VPS plan/region/image — all resolved from the client's ClientContext
+    rather than process env vars. Per-call request overrides still win
+    (passed-in product_id/region/image_id/ssl_type override client defaults).
+    """
     load_dotenv(override=True)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
-    _upsert_shard(sb, domain, status="deploying", provider=provider, region=region)
 
     try:
+        ctx = load_client_context_by_id(client_id)
+
+        # Apply client-default fallbacks for any unspecified deploy params
+        product_id = product_id or ctx.vps_plan
+        region = region or ctx.vps_region
+        image_id = image_id or ctx.vps_image_slug
+        ssl_type = ssl_type or ctx.ssl_type
+
+        # Friendly error if the client's Webdock isn't configured yet
+        if provider == "webdock" and not ctx.webdock:
+            raise RuntimeError(
+                f"Client {ctx.slug!r} has no Webdock token configured "
+                "(client_credentials.webdock_api_token_secret_id is NULL). "
+                "Add it to Vault and link via client_credentials before deploying."
+            )
+
+        _upsert_shard(sb, domain, client_id=client_id, status="deploying",
+                      provider=provider, region=region)
+
         state = ShardState(domain)
 
         # Step 0: Ensure domain
         _append_log(sb, job_id, "Ensuring domain on Cloudflare", step=0)
-        cf = CloudflareClient()
+        cf = ctx.cloudflare
         zone_id = cf.get_zone_id(domain)
         if not zone_id:
             _append_log(sb, job_id, "Domain not on Cloudflare, registering...")
@@ -190,7 +216,7 @@ def run_deploy(
         # Step 2: Provision VPS
         if not state.is_step_done("provision_vps"):
             _append_log(sb, job_id, f"Provisioning VPS via {provider}")
-            vps_client = _make_vps_client(provider)
+            vps_client = ctx.webdock if provider == "webdock" else _make_vps_client(provider)
             display_name = _mail_hostname(domain)
             ssh_pub_path = Path(os.environ.get("SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub")).expanduser()
             public_key = ssh_pub_path.read_text().strip()
@@ -236,14 +262,15 @@ def run_deploy(
             vps_client.wait_for_ssh(ip)
             state.mark_step_done("provision_vps")
         vps_ip = state.get("vps")["ip"]
-        _upsert_shard(sb, domain, vps_ip=vps_ip)
+        _upsert_shard(sb, domain, client_id=client_id, vps_ip=vps_ip)
         _append_log(sb, job_id, f"VPS ready at {vps_ip}", step=3)
 
         # Step 3: Set PTR
         if not state.is_step_done("set_ptr"):
             _append_log(sb, job_id, "Setting PTR (reverse DNS)")
             vps = state.get("vps")
-            vps_client = _make_vps_client(vps.get("provider", provider))
+            vps_provider = vps.get("provider", provider)
+            vps_client = ctx.webdock if vps_provider == "webdock" else _make_vps_client(vps_provider)
             hostname = _mail_hostname(domain)
             try:
                 vps_client.set_ptr(vps["id"], hostname)
@@ -255,11 +282,10 @@ def run_deploy(
         # Step 4: Configure DNS
         if not state.is_step_done("configure_dns"):
             _append_log(sb, job_id, "Configuring Cloudflare DNS")
-            cf = CloudflareClient()
             vps_ip = state.get("vps")["ip"]
             subs = state.get("subdomains")
-            dmarc_rua = os.environ.get("DMARC_RUA", f"dmarc@{domain}")
-            redirect_target = os.environ.get("REDIRECT_TARGET", "https://10xmanagers.com")
+            dmarc_rua = ctx.dmarc_rua or f"dmarc@{domain}"
+            redirect_target = ctx.redirect_url or f"https://{domain}"
             mail_host = _mail_hostname(domain)
 
             cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=True)
@@ -289,7 +315,7 @@ def run_deploy(
         # Step 5: Install mailserver
         _append_log(sb, job_id, f"Installing docker-mailserver (ssl={ssl_type})")
         vps = state.get("vps")
-        le_email = os.environ.get("LE_EMAIL", f"ops@{domain}")
+        le_email = ctx.le_email or f"ops@{domain}"
         ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
         ssh_user = _ssh_user(state)
         ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
@@ -307,10 +333,10 @@ def run_deploy(
                 )
                 if not out.strip().endswith(" healthy"):
                     ms.install_docker()
-                    ms.install_dms(domain, le_email, os.environ["CLOUDFLARE_API_TOKEN"].strip(), ssl_type=ssl_type)
+                    ms.install_dms(domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type)
             else:
                 ms.install_docker()
-                ms.install_dms(domain, le_email, os.environ["CLOUDFLARE_API_TOKEN"].strip(), ssl_type=ssl_type)
+                ms.install_dms(domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type)
         finally:
             ms.close()
         state.mark_step_done("install_mailserver")
@@ -333,7 +359,6 @@ def run_deploy(
         # Step 7: Setup DKIM
         if not state.is_step_done("setup_dkim"):
             _append_log(sb, job_id, "Generating DKIM keys")
-            cf = CloudflareClient()
             dkim: dict[str, str] = state.get("dkim") or {}
             ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
             ms.connect()
@@ -378,6 +403,7 @@ def run_deploy(
         # Update shard status
         step_flags = state.data.get("steps", {})
         _upsert_shard(sb, domain,
+            client_id=client_id,
             status="active",
             mailbox_count=len(state.get("mailboxes", [])),
             step_flags=step_flags,
@@ -390,7 +416,7 @@ def run_deploy(
     except Exception as exc:
         _append_log(sb, job_id, f"FAILED: {exc}")
         _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")
-        _upsert_shard(sb, domain, status="failed")
+        _upsert_shard(sb, domain, client_id=client_id, status="failed")
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +487,7 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
             shutil.move(str(bison_csv), archive_dir / f"{domain}-{timestamp}_bison.csv")
 
         _upsert_shard(sb, domain,
+            client_id=client_id,
             status="destroyed",
             destroyed_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -907,8 +934,17 @@ def run_load_to_bison(
 # DOMAIN SYNC
 # ---------------------------------------------------------------------------
 
-def run_domain_sync(job_id: str) -> None:
-    """Sync all Cloudflare zones + registrar data into infra_domains table."""
+def run_domain_sync(job_id: str, client_id: str, default_client_id_for_new: str | None = None) -> None:
+    """Sync the client's Cloudflare account zones into infra_domains.
+
+    Multi-tenant note: a Cloudflare account can host domains for multiple
+    clients (the 10x-managers CF account hosts both 10x-managers and
+    reachos brand domains). This sync updates rows that already have a
+    client_id mapping. For zones not yet in infra_domains, the row is
+    inserted with client_id = default_client_id_for_new if provided
+    (defaults to the calling client). Reassign via UPDATE infra_domains
+    if a new zone actually belongs to a different client.
+    """
     import time as _time
 
     load_dotenv(override=True)
@@ -916,19 +952,27 @@ def run_domain_sync(job_id: str) -> None:
     _update_job(sb, job_id, status="running")
 
     try:
-        cf = CloudflareClient()
+        ctx = load_client_context_by_id(client_id)
+        cf = ctx.cloudflare
+        new_client_id = default_client_id_for_new or client_id
 
-        # Step 1: List all zones
+        # Step 1: List all zones in this CF account
         _append_log(sb, job_id, "Fetching all zones from Cloudflare", step=1)
         zones = cf.list_zones()
         _append_log(sb, job_id, f"Found {len(zones)} zones")
 
-        # Load existing domains to check which already have registrar data
-        existing = sb.table("infra_domains").select("domain, registrar_created_at").execute()
-        has_registrar = {
-            r["domain"] for r in (existing.data or [])
-            if r.get("registrar_created_at")
-        }
+        # Load existing rows to preserve client_id and skip registrar refetch
+        existing = (
+            sb.table("infra_domains")
+            .select("domain, client_id, registrar_created_at")
+            .execute()
+        )
+        existing_client_id: dict[str, str] = {}
+        has_registrar: set[str] = set()
+        for r in existing.data or []:
+            existing_client_id[r["domain"]] = r.get("client_id")
+            if r.get("registrar_created_at"):
+                has_registrar.add(r["domain"])
 
         # Step 2: Upsert each zone
         _append_log(sb, job_id, "Syncing zone and registrar data", step=2)
@@ -947,22 +991,22 @@ def run_domain_sync(job_id: str) -> None:
                 "last_synced_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            # Only fetch registrar info if we don't already have the reg date
             if domain not in has_registrar:
                 try:
                     reg_info = cf.registrar_domain_info(domain)
                     if reg_info:
                         row["registrar_created_at"] = reg_info.get("created_at") or reg_info.get("registered_at")
                         row["registrar_status"] = reg_info.get("status")
-                    _time.sleep(0.3)  # Gentle rate limiting
+                    _time.sleep(0.3)
                 except Exception as exc:
                     _append_log(sb, job_id, f"  Registrar lookup failed for {domain}: {exc}")
 
-            # Upsert by domain
-            existing_row = sb.table("infra_domains").select("id").eq("domain", domain).execute()
-            if existing_row.data:
+            if domain in existing_client_id:
+                # Existing row — preserve its client_id, just update zone data
                 sb.table("infra_domains").update(row).eq("domain", domain).execute()
             else:
+                # New zone — attribute to the configured default client
+                row["client_id"] = new_client_id
                 sb.table("infra_domains").insert(row).execute()
 
             synced += 1
@@ -979,14 +1023,20 @@ def run_domain_sync(job_id: str) -> None:
 # DOMAIN REGISTER
 # ---------------------------------------------------------------------------
 
-def run_domain_register(job_id: str, domain: str) -> None:
-    """Register a domain via Cloudflare Registrar and add to infra_domains."""
+def run_domain_register(job_id: str, client_id: str, domain: str) -> None:
+    """Register a domain via Cloudflare Registrar and add to infra_domains.
+
+    Uses the client's Cloudflare account (via ClientContext) so the new
+    zone lands on the right account. The domain is attributed to the
+    given client in infra_domains.
+    """
     load_dotenv(override=True)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
     try:
-        cf = CloudflareClient()
+        ctx = load_client_context_by_id(client_id)
+        cf = ctx.cloudflare
 
         # Step 1: Check availability
         _append_log(sb, job_id, f"Checking availability of {domain}", step=1)
@@ -1013,6 +1063,7 @@ def run_domain_register(job_id: str, domain: str) -> None:
         zone = zone_info.get("result", {})
 
         row = {
+            "client_id": client_id,
             "domain": domain,
             "zone_id": zone_id,
             "zone_status": zone.get("status", "pending"),
@@ -1027,9 +1078,22 @@ def run_domain_register(job_id: str, domain: str) -> None:
             "last_synced_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        existing_row = sb.table("infra_domains").select("id").eq("domain", domain).execute()
+        # Scope by (client_id, domain) — multi-tenant unique key
+        existing_row = (
+            sb.table("infra_domains")
+            .select("id")
+            .eq("client_id", client_id)
+            .eq("domain", domain)
+            .execute()
+        )
         if existing_row.data:
-            sb.table("infra_domains").update(row).eq("domain", domain).execute()
+            (
+                sb.table("infra_domains")
+                .update(row)
+                .eq("client_id", client_id)
+                .eq("domain", domain)
+                .execute()
+            )
         else:
             sb.table("infra_domains").insert(row).execute()
 
