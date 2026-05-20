@@ -52,10 +52,24 @@ class WebdockClient:
         return None
 
     @staticmethod
+    def _extract_ipv6(raw: dict) -> str | None:
+        """IPv6 equivalent. Webdock returns ipv6 as a string like
+        '2a0f:0f01:0207:573::0'. Filter out the literal placeholder
+        '::0' which sometimes shows up before the v6 stack is fully
+        assigned during provisioning.
+        """
+        for key in ("ipv6", "ipv6Address", "mainIpv6"):
+            v = raw.get(key)
+            if isinstance(v, str) and v and v not in ("::0", "::", "0:0:0:0:0:0:0:0"):
+                return v
+        return None
+
+    @staticmethod
     def _normalise(raw: dict) -> dict:
         return {
             "id": raw.get("slug") or raw.get("id"),
             "ip": WebdockClient._extract_ipv4(raw),
+            "ip6": WebdockClient._extract_ipv6(raw),
             "status": raw.get("status"),
             "display_name": raw.get("name"),
         }

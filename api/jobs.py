@@ -268,13 +268,14 @@ def run_deploy(
 
             inst = vps_client.wait_for_instance_ready(instance_id)
             ip = inst.get("ip")
+            ip6 = inst.get("ip6")
             # Per-client blocklist webhook — skips silently if the client
             # hasn't configured one (no leaks to other clients' monitoring).
             blocklist.notify_check_ip(ip, ctx.blocklist_webhook_url)
             ssh_credentials = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
 
             state.set("vps", {
-                "provider": provider, "id": instance_id, "ip": ip,
+                "provider": provider, "id": instance_id, "ip": ip, "ip6": ip6,
                 "product_id": product_id, "region": region,
                 "ssh_user": ssh_credentials["username"],
                 "ssh_bootstrap_password": ssh_credentials.get("password"),
@@ -302,14 +303,27 @@ def run_deploy(
         # Step 4: Configure DNS
         if not state.is_step_done("configure_dns"):
             _append_log(sb, job_id, "Configuring Cloudflare DNS")
-            vps_ip = state.get("vps")["ip"]
+            vps_state = state.get("vps")
+            vps_ip = vps_state["ip"]
+            vps_ip6 = vps_state.get("ip6")  # None on Webdock plans without v6
             subs = state.get("subdomains")
             dmarc_rua = ctx.dmarc_rua or f"dmarc@{domain}"
             redirect_target = ctx.redirect_url or f"https://{domain}"
             mail_host = _mail_hostname(domain)
 
+            # Build SPF including both v4 + v6 (when v6 is present). Real
+            # outbound is dual-stack from docker-mailserver — if SPF doesn't
+            # include the v6, Gmail/Outlook will fail SPF on v6-delivered mail.
+            spf_parts = [f"ip4:{vps_ip}"]
+            if vps_ip6:
+                spf_parts.append(f"ip6:{vps_ip6}")
+            spf_parts.extend(["mx", "-all"])
+            spf_record = "v=spf1 " + " ".join(spf_parts)
+
             cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=True)
             cf.upsert_record(zone_id, "A", mail_host, vps_ip, proxied=False)
+            if vps_ip6:
+                cf.upsert_record(zone_id, "AAAA", mail_host, vps_ip6, proxied=False)
             cf.upsert_record(
                 zone_id, "TXT", f"_dmarc.{domain}",
                 f"v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
@@ -335,8 +349,12 @@ def run_deploy(
                 sub_mail = f"mail.{fqdn}"
                 cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=(sub != "mail"))
                 cf.upsert_record(zone_id, "A", sub_mail, vps_ip, proxied=False)
+                # AAAA on the non-proxied mail subdomain. Proxied A records
+                # don't need AAAA — Cloudflare's edge handles v6 transparently.
+                if vps_ip6:
+                    cf.upsert_record(zone_id, "AAAA", sub_mail, vps_ip6, proxied=False)
                 cf.upsert_record(zone_id, "MX", fqdn, sub_mail, priority=10)
-                cf.upsert_record(zone_id, "TXT", fqdn, f"v=spf1 ip4:{vps_ip} mx -all")
+                cf.upsert_record(zone_id, "TXT", fqdn, spf_record)
                 cf.upsert_record(
                     zone_id, "TXT", f"_dmarc.{fqdn}",
                     f"v=DMARC1; p=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
