@@ -1,0 +1,16 @@
+# Append to /etc/caddy/Caddyfile on the API VPS, then reload Caddy:
+#   sudo systemctl reload caddy
+#
+# The existing infra-api.10xmanagers.com block stays untouched.
+
+infra-api-v2.10xmanagers.com {
+    reverse_proxy 127.0.0.1:8001
+
+    # Light access log for the early days; remove once stable.
+    log {
+        output file /var/log/caddy/infra-api-v2.access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
