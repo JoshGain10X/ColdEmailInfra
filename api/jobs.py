@@ -206,16 +206,28 @@ def run_deploy(
         _append_log(sb, job_id, f"Domain ready, zone_id={zone_id}", step=1)
 
         # Step 1: Generate subdomains & mailboxes
+        # If the client has a single-persona mailbox pool configured
+        # (e.g. ReachOS, where every mailbox is "Josh Gain" under different
+        # local-part aliases), that takes precedence; otherwise default
+        # multi-persona generation from British name lists.
         if not state.is_step_done("generate"):
             _append_log(sb, job_id, "Generating subdomains and mailboxes")
             subs = pick_subdomains(domain)
             seed = secrets.randbits(64)
-            mailboxes = generate_mailboxes(domain, subs, seed=seed)
+            mailboxes = generate_mailboxes(
+                domain, subs, seed=seed,
+                local_parts=ctx.mailbox_local_parts,
+                display_first_name=ctx.mailbox_display_first_name,
+                display_last_name=ctx.mailbox_display_last_name,
+            )
             state.set("subdomains", subs)
             state.set("mailbox_seed", seed)
             state.set("mailboxes", mailboxes)
             state.mark_step_done("generate")
-        _append_log(sb, job_id, f"Generated {len(state.get('subdomains'))} subdomains, {len(state.get('mailboxes'))} mailboxes", step=2)
+        mailbox_mode = "single-persona" if ctx.mailbox_local_parts else "multi-persona"
+        _append_log(sb, job_id,
+            f"Generated {len(state.get('subdomains'))} subdomains, "
+            f"{len(state.get('mailboxes'))} mailboxes ({mailbox_mode})", step=2)
 
         # Step 2: Provision VPS
         if not state.is_step_done("provision_vps"):

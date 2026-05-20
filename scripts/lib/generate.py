@@ -39,17 +39,70 @@ def pick_subdomains(domain: str, seed: int | None = None) -> list[str]:
     return list(SUBDOMAINS)
 
 
-def generate_mailboxes(root_domain: str, subdomain_labels: list[str], seed: int | None = None) -> list[dict]:
+def generate_mailboxes(
+    root_domain: str,
+    subdomain_labels: list[str],
+    seed: int | None = None,
+    local_parts: list[str] | None = None,
+    display_first_name: str | None = None,
+    display_last_name: str | None = None,
+) -> list[dict]:
     """Generate MAILBOXES_PER_SUBDOMAIN mailboxes for each subdomain.
 
-    Each mailbox has first/last drawn randomly from the bundled lists, unique within the shard.
+    Two modes:
+
+    1. **Default (multi-persona)** — first/last drawn randomly from the bundled
+       British name lists. Each mailbox is a different fictional person.
+       Used for most agency clients.
+
+    2. **Single-persona pool** — when `local_parts` is provided, every mailbox
+       on the shard uses the same display name (display_first_name +
+       display_last_name) and an email local-part picked from `local_parts`.
+       Used for founder-led / one-person clients (e.g. ReachOS, where every
+       mailbox is "Josh Gain" under different local-part aliases per
+       subdomain). MAILBOXES_PER_SUBDOMAIN unique local-parts are picked
+       per subdomain so the same alias never appears twice on one subdomain;
+       across subdomains, the local-parts may repeat (different FQDN).
     """
+    rng = random.Random(seed if seed is not None else secrets.randbits(64))
+    mailboxes: list[dict] = []
+
+    if local_parts:
+        if not display_first_name:
+            raise ValueError(
+                "display_first_name required when local_parts is set "
+                "(single-persona mode needs a fixed display name)"
+            )
+        if len(local_parts) < MAILBOXES_PER_SUBDOMAIN:
+            raise ValueError(
+                f"Need at least {MAILBOXES_PER_SUBDOMAIN} local_parts for "
+                f"unique aliases per subdomain; got {len(local_parts)}"
+            )
+
+        last_name = display_last_name or ""
+        for sub in subdomain_labels:
+            fqdn = f"{sub}.{root_domain}"
+            # Pick MAILBOXES_PER_SUBDOMAIN unique local-parts for this subdomain.
+            # Different subdomains get different selections, so across the shard
+            # all 10 pool entries show up multiple times — but every (fqdn,
+            # local_part) pair is unique by construction.
+            chosen = rng.sample(local_parts, MAILBOXES_PER_SUBDOMAIN)
+            for local_part in chosen:
+                mailboxes.append({
+                    "first_name": display_first_name,
+                    "last_name": last_name,
+                    "subdomain": sub,
+                    "fqdn": fqdn,
+                    "local_part": local_part,
+                    "email": f"{local_part}@{fqdn}",
+                    "password": SHARED_MAILBOX_PASSWORD,
+                })
+        return mailboxes
+
+    # Multi-persona mode (existing behaviour)
     first_names = _load_lines("british_female_names.txt")
     surnames = _load_lines("british_surnames.txt")
-    rng = random.Random(seed if seed is not None else secrets.randbits(64))
-
     used: set[tuple[str, str]] = set()
-    mailboxes: list[dict] = []
 
     for sub in subdomain_labels:
         fqdn = f"{sub}.{root_domain}"

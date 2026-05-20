@@ -73,6 +73,9 @@ class ClientContext:
     le_email: str
     ssl_type: str
     blocklist_webhook_url: Optional[str]
+    mailbox_local_parts: Optional[list[str]]
+    mailbox_display_first_name: Optional[str]
+    mailbox_display_last_name: Optional[str]
     cloudflare: CloudflareClient
     webdock: Optional[WebdockClient]
     workspaces: list[BisonWorkspace]
@@ -269,6 +272,9 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         le_email=settings.get("le_email") or f"ops@{default_email_host}",
         ssl_type=settings.get("ssl_type") or "letsencrypt",
         blocklist_webhook_url=settings.get("blocklist_webhook_url"),
+        mailbox_local_parts=settings.get("mailbox_local_parts"),
+        mailbox_display_first_name=settings.get("mailbox_display_first_name"),
+        mailbox_display_last_name=settings.get("mailbox_display_last_name"),
         cloudflare=cf,
         webdock=webdock,
         workspaces=workspaces,
