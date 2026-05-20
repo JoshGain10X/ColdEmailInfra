@@ -94,6 +94,47 @@ SELECT
 FROM clients WHERE slug = 'acme-co';
 ```
 
+### Step 5b — Subdomain pool (NEW — relevant per-business names)
+
+Each shard random-samples 6-8 subdomains from a per-client pool of ~20-25
+business-relevant names. This breaks the Smartlead/Instantly fingerprint
+where every shard uses the same `hello/hi/contact/mail/team/...` set.
+
+Interview the user:
+- "What's the natural vocabulary around your client's product/service?"
+- Brainstorm 20-25 plausible subdomain words that fit. Mix:
+  - Direct product terms (recruitment, candidates, employers, app, platform)
+  - Action words (hire, connect, intro, demo, meet, reach, find)
+  - Departmental (sales, talent, careers, partnerships)
+  - Generic-but-on-brand fillers (hi, hello, team, growth, direct)
+
+Example pools we've used:
+- 10X Managers (leadership training): leadership, managers, develop, team,
+  programmes, learning, growth, talent, lab, mentorship, coaching, community,
+  performance, strategy, executive, board, partner, direct, meet, connect,
+  lead, reach, talk, inbox, journey, grow, culture, careers
+- Scouted (tech sales recruitment): recruitment, candidates, employers,
+  partnerships, talent, careers, opportunities, hire, roles, connect, intro,
+  talk, meet, partners, growth, match, place, network, team, pipeline,
+  sales, reach, find, top-talent, direct, inbox
+- ReachOS (founder-led SaaS): hi, hello, hey, founder, build, team, app,
+  try, get, demo, meet, chat, talk, intro, direct, inbox, start, growth,
+  from, at, platform, outbound, outreach, reply, reachout
+
+```sql
+UPDATE client_settings
+SET subdomain_pool = ARRAY[ /* the 20-25 names */ ]
+WHERE client_id = (SELECT id FROM clients WHERE slug = '...');
+```
+
+The deploy code will random-sample 6-8 of these per shard (and use a varied
+5-15 mailboxes per subdomain summing to mailbox_count), so two shards from
+the same client never have an identical layout.
+
+**Constraint for single-persona clients:** the mailbox total is capped at
+`n_subdomains * len(mailbox_local_parts)`. ReachOS with 10 aliases × 8 subs
+caps at 80 mailboxes/shard. Expand the local_parts list if you need 100.
+
 ### Step 6 — Signature formula (the conversational bit)
 
 Use `signature-formula-help.md` for the interview pattern. You'll be drafting:
