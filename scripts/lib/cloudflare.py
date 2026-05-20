@@ -72,7 +72,13 @@ class CloudflareClient:
         results = body.get("result") or []
         return results[0]["id"] if results else None
 
-    def wait_for_zone(self, domain: str, timeout: int = 300) -> str:
+    def wait_for_zone(self, domain: str, timeout: int = 1200) -> str:
+        # CF Registrar consistently takes 10–15 min to activate a zone after
+        # the registration POST succeeds. The old 300s/600s defaults caused
+        # spurious "did not become active" TimeoutErrors on jobs that were
+        # actually working — verified during the Scouted onboarding batch of
+        # 19 May 20 2026 where all 19 hit the timeout but every zone was
+        # active in CF by minute 12. 20 min covers the long tail.
         deadline = time.time() + timeout
         while time.time() < deadline:
             zone_id = self.get_zone_id(domain)
