@@ -625,7 +625,12 @@ def run_verify(job_id: str, client_id: str, domain: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _generate_signature(first: str, last: str, email: str, company: str) -> str:
-    """Generate a randomised HTML email signature for deliverability."""
+    """Legacy single-tenant signature generator (random.choice templates).
+
+    Kept for the v1 single-tenant code path. The v2 multi-tenant path uses
+    _generate_signature_from_formula below, which consumes a SignatureFormula
+    from the client's signature_formulas row.
+    """
     import random
 
     templates = [
@@ -647,22 +652,111 @@ def _generate_signature(first: str, last: str, email: str, company: str) -> str:
         f"<p>{first} {last}<br>{company} Team</p>",
     ]
     sig = random.choice(templates)
-
-    # ~10% chance of a mobile send tag
     if random.random() < 0.10:
-        mobile_tags = [
-            "Sent from my iPhone",
-            "Sent from my mobile",
-            "Sent from mobile",
-        ]
+        mobile_tags = ["Sent from my iPhone", "Sent from my mobile", "Sent from mobile"]
         sig += f"<p style=\"font-size:12px;color:#888;\">{random.choice(mobile_tags)}</p>"
-
     return sig
 
 
-def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, tag: str = "Custom SMTP") -> None:
-    """Create shard mailboxes individually in Bison with unique signatures."""
-    import random
+def _email_seed(email: str) -> int:
+    """Deterministic seed derived from email address.
+
+    Matches the seed function used in the old supabase/functions/load-to-bison
+    edge function, so the v2 API produces identical signatures to what the
+    edge function was producing for existing senders.
+    """
+    h = 0
+    for c in email:
+        h = (h * 31 + ord(c)) & 0xFFFFFFFF
+    return h
+
+
+def _generate_signature_from_formula(first: str, last: str, email: str, formula) -> str:
+    """Multi-tenant signature generator driven by a SignatureFormula.
+
+    Deterministic by email address so re-runs produce the same signature
+    for the same sender. Honours the client's style (html / plaintext),
+    company name pool, title pool, quote pool, opt-out pool, and per-pool
+    inclusion rates.
+    """
+    full_name = f"{first} {last}".strip() if last else first
+
+    # Plaintext: short name + company (e.g. ReachOS workspace style)
+    if formula.style == "plaintext":
+        company = formula.company_names[0] if formula.company_names else ""
+        if company:
+            return f"{full_name}\n{company}".strip()
+        return full_name
+
+    # Degenerate HTML case — no formula pools configured
+    if not formula.titles or not formula.company_names:
+        return f"<p>{full_name}</p>"
+
+    seed = _email_seed(email)
+    title = formula.titles[seed % len(formula.titles)]
+    company = formula.company_names[seed % len(formula.company_names)]
+    fmt = seed % max(1, formula.format_variants)
+    include_pronouns = (seed % 10) < int(formula.include_pronouns_rate * 10)
+    include_quote = (seed % 7) < int(formula.include_quote_rate * 7)
+    include_email = (seed % 5) < int(formula.include_email_rate * 5)
+
+    quote = formula.quotes[(seed // 4) % len(formula.quotes)] if formula.quotes else None
+    optout = formula.optouts[seed % len(formula.optouts)] if formula.optouts else None
+
+    pronouns = " (she/her)" if include_pronouns else ""
+
+    # 6 format variants. fmt 0–3 show the title on the name line; 4–5 keep it
+    # on the company line. Matches the rotation the edge function used.
+    if fmt <= 3:
+        name_line = f"<p><strong>{full_name}</strong>{pronouns} | {title}</p>"
+    else:
+        name_line = f"<p><strong>{full_name}</strong>{pronouns}</p>"
+
+    if fmt == 0:
+        company_line = f"<p>{company}</p>"
+    elif fmt == 1:
+        company_line = f"<p>{title} · {company}</p>"
+    elif fmt == 2:
+        company_line = f"<p>{title}, {company}</p>"
+    elif fmt == 3:
+        company_line = f"<p>{company} | {title}</p>"
+    elif fmt == 4:
+        company_line = f"<p>{title} · {company}</p>"
+    else:
+        company_line = f"<p>{title}, {company}</p>"
+
+    middle = []
+    if include_email and include_quote and quote:
+        if seed % 3 == 0:
+            middle.append(f"<p>{email}</p>")
+            middle.append(f"<p><em>\"{quote}\"</em></p>")
+        else:
+            middle.append(f"<p><em>\"{quote}\"</em></p>")
+            middle.append(f"<p>{email}</p>")
+    elif include_email:
+        middle.append(f"<p>{email}</p>")
+    elif include_quote and quote:
+        middle.append(f"<p><em>\"{quote}\"</em></p>")
+
+    parts = [name_line, company_line] + middle
+    if optout:
+        parts.append(f"<p>{optout}</p>")
+    return "\n".join(parts)
+
+
+def run_load_to_bison(
+    job_id: str,
+    client_id: str,
+    domain: str,
+    workspace: str | None = None,
+    tag: str = "Custom SMTP",
+) -> None:
+    """Create shard mailboxes individually in Bison with formula-driven signatures.
+
+    Multi-tenant: resolves the target Bison workspace and signature formula
+    from the client's ClientContext rather than from a global bison_workspaces
+    table or hardcoded company names.
+    """
     import time as _time
 
     load_dotenv(override=True)
@@ -674,76 +768,34 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
         if not csv_file.exists():
             raise RuntimeError(f"CSV not found at {csv_file}. Run deploy first.")
 
-        base_url = os.environ.get("BISON_API_BASE", "https://send.spamproofed.com").rstrip("/")
-
-        # --- Token resolution: DB-first, env-var fallback ---
+        # Resolve workspace + signature formula via ClientContext
         _append_log(sb, job_id, "Resolving workspace token", step=1)
+        ctx = load_client_context_by_id(client_id)
+        try:
+            target_ws = ctx.workspace(workspace)  # named, or default if None
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
 
-        chosen_token = None
-        ws_name = workspace or "?"
+        ws_name = target_ws.name
+        bison = target_ws.client()
+        base_url = target_ws.base_url.rstrip("/")
+        chosen_token = target_ws._api_key  # used directly only for PATCH below
+        formula = ctx.signature_for_workspace(target_ws.id)
 
-        # Try bison_workspaces table first
-        if workspace:
-            db_result = sb.table("bison_workspaces").select(
-                "api_key, workspace_name"
-            ).eq("workspace_name", workspace).execute()
-            if db_result.data:
-                chosen_token = db_result.data[0]["api_key"]
-                ws_name = db_result.data[0]["workspace_name"]
-        else:
-            # No workspace specified — use default from DB
-            db_result = sb.table("bison_workspaces").select(
-                "api_key, workspace_name"
-            ).eq("is_default", True).execute()
-            if db_result.data:
-                chosen_token = db_result.data[0]["api_key"]
-                ws_name = db_result.data[0]["workspace_name"]
+        _append_log(sb, job_id, f"Target workspace: {ws_name} (client: {ctx.slug})", step=2)
 
-        # Fallback to BISON_API_TOKENS env var
-        if not chosen_token:
-            tokens_raw = os.environ.get("BISON_API_TOKENS", "").strip()
-            if not tokens_raw:
-                raise RuntimeError("No Bison workspace configured and BISON_API_TOKENS not set")
-            tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
-
-            from lib.bison_api import BisonClient
-            for tok in tokens:
-                try:
-                    client = BisonClient(tok, base_url)
-                    wss = client.get_workspaces()
-                    if len(wss) == 1:
-                        ws_info = wss[0]
-                        if workspace and ws_info.get("name") != workspace:
-                            continue
-                        chosen_token = tok
-                        ws_name = ws_info.get("name", "?")
-                        break
-                except Exception:
-                    continue
-
-        if not chosen_token:
-            raise RuntimeError(f"Could not resolve token for workspace {workspace!r}")
-
-        _append_log(sb, job_id, f"Target workspace: {ws_name}", step=2)
-
-        # Company name: ReachOS workspace → "ReachOS", everything else → "10X Managers"
-        company = "ReachOS" if ws_name == "ReachOS" else "10X Managers"
-
-        # --- Read CSV rows ---
+        # Read CSV rows
         rows = []
         with csv_file.open(newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
                 rows.append(row)
-
         if not rows:
             raise RuntimeError(f"CSV is empty: {csv_file}")
 
         _append_log(sb, job_id, f"Creating {len(rows)} senders individually with signatures", step=3)
 
-        # --- Create each sender individually with signature ---
-        from lib.bison_api import BisonClient
-        client = BisonClient(chosen_token, base_url)
+        # Create each sender individually with formula-driven signature
         created_ids = []
         failed = 0
 
@@ -757,12 +809,11 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
             smtp_port = int(row.get("SMTP Port", "465"))
             daily_limit = int(row.get("Daily Limit", "10"))
 
-            # Parse first/last from Name column
             parts = name.strip().split(" ", 1)
             first = parts[0] if parts else "Team"
             last = parts[1] if len(parts) > 1 else ""
 
-            signature = _generate_signature(first, last, email_addr, company)
+            signature = _generate_signature_from_formula(first, last, email_addr, formula)
 
             payload = {
                 "name": name,
@@ -779,7 +830,7 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
             }
 
             try:
-                result = client.create_sender_imap_smtp(payload)
+                result = bison.create_sender_imap_smtp(payload)
                 sender_id = result.get("id")
                 if sender_id:
                     created_ids.append(sender_id)
@@ -811,20 +862,20 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
 
         _append_log(sb, job_id, f"Created {len(created_ids)}/{len(rows)} senders", step=4)
 
-        # --- Tag all created senders ---
+        # Tag all created senders
         if created_ids:
             _append_log(sb, job_id, f"Attaching tag '{tag}'", step=5)
             try:
-                tag_obj = client.find_or_create_tag(tag)
+                tag_obj = bison.find_or_create_tag(tag)
                 tag_id = tag_obj.get("id")
                 if tag_id:
-                    client.attach_tag_to_senders(tag_id, created_ids)
+                    bison.attach_tag_to_senders(tag_id, created_ids)
                     _append_log(sb, job_id, f"Tagged {len(created_ids)} senders")
             except Exception as tag_exc:
                 _append_log(sb, job_id, f"Tag attach warning: {tag_exc}")
 
-        # --- Upload CSV to Supabase Storage for CRM download ---
-        storage_path = f"{domain}.csv"
+        # Upload CSV to Supabase Storage, namespaced by client
+        storage_path = f"{ctx.slug}/{domain}.csv"
         try:
             with open(csv_file, "rb") as fh:
                 sb.storage.from_("shard-csvs").upload(
@@ -835,9 +886,15 @@ def run_load_to_bison(job_id: str, domain: str, workspace: str | None = None, ta
             _append_log(sb, job_id, f"CSV upload warning: {upload_exc}")
             storage_path = None
 
-        _upsert_shard(sb, domain, bison_loaded=True, bison_workspace=ws_name,
-                      bison_loaded_at=datetime.now(timezone.utc).isoformat(),
-                      csv_storage_path=storage_path)
+        _upsert_shard(
+            sb, domain,
+            client_id=client_id,
+            client_bison_workspace_id=target_ws.id,
+            bison_loaded=True,
+            bison_workspace=ws_name,
+            bison_loaded_at=datetime.now(timezone.utc).isoformat(),
+            csv_storage_path=storage_path,
+        )
         _append_log(sb, job_id, f"Done: {len(created_ids)} senders loaded to {ws_name}", step=6)
         _complete_job(sb, job_id)
 
