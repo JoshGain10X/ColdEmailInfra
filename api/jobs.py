@@ -476,13 +476,19 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
 # VERIFY
 # ---------------------------------------------------------------------------
 
-def run_verify(job_id: str, domain: str) -> None:
-    """Run verification checks — called as a background task."""
+def run_verify(job_id: str, client_id: str, domain: str) -> None:
+    """Run verification checks — called as a background task.
+
+    Verification itself uses no per-client credentials (DNS/SMTP/TLS probes
+    are public), but client_id is loaded so the shard row stays scoped to
+    the right tenant on update.
+    """
     load_dotenv(override=True)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
     try:
+        ctx = load_client_context_by_id(client_id)
         state = ShardState(domain)
         if not state.is_step_done("setup_dkim"):
             raise RuntimeError(f"Shard {domain} has not completed DKIM step")
@@ -602,7 +608,7 @@ def run_verify(job_id: str, domain: str) -> None:
 
         if all_passed:
             state.mark_step_done("verify")
-            _upsert_shard(sb, domain, status="verified")
+            _upsert_shard(sb, domain, client_id=client_id, status="verified")
             _append_log(sb, job_id, "All checks PASSED", step=5)
         else:
             _append_log(sb, job_id, "Some checks FAILED", step=5)
