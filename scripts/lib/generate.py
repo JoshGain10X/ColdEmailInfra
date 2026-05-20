@@ -147,11 +147,17 @@ def generate_mailboxes(
     if n_subs == 0:
         raise ValueError("No subdomains provided")
 
-    # In single-persona mode, per-sub count is capped by pool size
-    # (can't have more unique aliases per sub than there are pool entries).
+    # In single-persona mode, per-sub count is hard-capped by the alias pool
+    # size — can't have more unique aliases per sub than there are pool
+    # entries. If the requested total exceeds n_subs * pool_size, cap it
+    # so we don't blow up. Operator can expand local_parts or raise
+    # subdomain_count to lift the cap.
     max_per = DEFAULT_MAILBOXES_PER_SUBDOMAIN_MAX
     if local_parts:
         max_per = min(max_per, len(local_parts))
+        achievable = n_subs * len(local_parts)
+        if mailbox_count_total > achievable:
+            mailbox_count_total = achievable
 
     per_sub_counts = _distribute_mailboxes(
         mailbox_count_total, n_subs, rng, max_per=max_per
