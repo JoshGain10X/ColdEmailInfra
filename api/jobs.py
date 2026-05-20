@@ -31,6 +31,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from lib import blocklist
 from lib.bison import export as bison_export
+from lib.client_context import (
+    ClientContext,
+    load_client_context_by_id,
+    load_client_context_for_shard,
+)
 from lib.cloudflare import CloudflareClient
 from lib.contabo import ContaboClient
 from lib.generate import generate_mailboxes, pick_subdomains
@@ -88,10 +93,26 @@ def _complete_job(sb: Client, job_id: str, error: str | None = None) -> None:
 
 
 def _upsert_shard(sb: Client, domain: str, **fields: Any) -> None:
-    """Insert or update the infra_shards row for a domain."""
-    existing = sb.table("infra_shards").select("id").eq("domain", domain).execute()
+    """Insert or update the infra_shards row for (client_id, domain).
+
+    Multi-tenant note: pass client_id as a keyword arg to scope the lookup.
+    Without client_id this falls back to legacy single-tenant behaviour
+    (matches any shard with this domain), which is safe only when running
+    against a single-client database.
+    """
+    client_id = fields.get("client_id")
+    query = sb.table("infra_shards").select("id").eq("domain", domain)
+    if client_id:
+        query = query.eq("client_id", client_id)
+    existing = query.execute()
+
     if existing.data:
-        sb.table("infra_shards").update(fields).eq("domain", domain).execute()
+        # Don't try to overwrite client_id on update — it's the primary key
+        update_fields = {k: v for k, v in fields.items() if k != "client_id"}
+        update_query = sb.table("infra_shards").update(update_fields).eq("domain", domain)
+        if client_id:
+            update_query = update_query.eq("client_id", client_id)
+        update_query.execute()
     else:
         sb.table("infra_shards").insert({"domain": domain, **fields}).execute()
 
@@ -376,8 +397,14 @@ def run_deploy(
 # DESTROY
 # ---------------------------------------------------------------------------
 
-def run_destroy(job_id: str, domain: str) -> None:
-    """Destroy a shard — called as a background task."""
+def run_destroy(job_id: str, client_id: str, domain: str) -> None:
+    """Destroy a shard — called as a background task.
+
+    client_id is now required: it determines which Webdock account holds the
+    VPS and which Cloudflare account holds the zone. The two are looked up
+    via ClientContext at the top so the per-step code stays unchanged in
+    shape.
+    """
     import shutil
     import time
 
@@ -386,25 +413,35 @@ def run_destroy(job_id: str, domain: str) -> None:
     _update_job(sb, job_id, status="running")
 
     try:
+        ctx = load_client_context_by_id(client_id)
         state = ShardState(domain)
         if not state.path.exists():
             raise RuntimeError(f"No state file for {domain}")
 
-        _upsert_shard(sb, domain, status="destroying")
+        _upsert_shard(sb, domain, client_id=client_id, status="destroying")
 
         # Step 1: Destroy VPS
         _append_log(sb, job_id, "Destroying VPS", step=1)
         vps = state.get("vps")
         if vps and vps.get("id"):
-            provider = vps.get("provider", "contabo")
+            provider = vps.get("provider", "webdock")
             try:
-                _make_vps_client(provider).destroy_instance(vps["id"])
+                if provider == "webdock":
+                    if not ctx.webdock:
+                        raise RuntimeError(
+                            f"Client {ctx.slug!r} has no Webdock credentials configured — "
+                            "cannot destroy a Webdock VPS. Add to client_credentials."
+                        )
+                    ctx.webdock.destroy_instance(vps["id"])
+                else:
+                    # Non-webdock providers fall back to legacy env-var path
+                    _make_vps_client(provider).destroy_instance(vps["id"])
             except Exception as exc:
                 _append_log(sb, job_id, f"VPS destroy warning: {exc}")
 
-        # Step 2: Delete DNS records
+        # Step 2: Delete DNS records (use the client's Cloudflare account)
         _append_log(sb, job_id, "Deleting DNS records", step=2)
-        cf = CloudflareClient()
+        cf = ctx.cloudflare
         zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)
         if zone_id:
             removed = cf.delete_all_records(zone_id)

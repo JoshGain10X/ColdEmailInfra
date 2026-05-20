@@ -65,9 +65,13 @@ class ClientContext:
     redirect_url: Optional[str]
     vps_region: str
     vps_plan: str
+    vps_image_slug: Optional[str]
     mailbox_count: int
     subdomain_count: int
     default_daily_limit: int
+    dmarc_rua: str
+    le_email: str
+    ssl_type: str
     cloudflare: CloudflareClient
     webdock: Optional[WebdockClient]
     workspaces: list[BisonWorkspace]
@@ -246,9 +250,13 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         redirect_url=settings.get("redirect_url"),
         vps_region=settings.get("vps_region") or "dk",
         vps_plan=settings.get("vps_plan") or "webdocknano",
+        vps_image_slug=settings.get("vps_image_slug"),
         mailbox_count=int(settings.get("mailbox_count") or 100),
         subdomain_count=int(settings.get("subdomain_count") or 20),
         default_daily_limit=int(settings.get("default_daily_limit") or 10),
+        dmarc_rua=settings.get("dmarc_rua") or f"dmarc@{client_row.get('website_url','').replace('https://','').replace('http://','').rstrip('/') or client_row['slug']}",
+        le_email=settings.get("le_email") or f"ops@{client_row.get('website_url','').replace('https://','').replace('http://','').rstrip('/') or client_row['slug']}",
+        ssl_type=settings.get("ssl_type") or "letsencrypt",
         cloudflare=cf,
         webdock=webdock,
         workspaces=workspaces,
