@@ -447,6 +447,9 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
         _upsert_shard(sb, domain, client_id=client_id, status="destroying")
 
         # Step 1: Destroy VPS
+        # Distinguish "already gone" (404 / not found) from "really failed".
+        # The old behaviour swallowed both as a warning and let the job continue,
+        # which left orphan VPSes billing forever (~£3.70/mo each on Webdock).
         _append_log(sb, job_id, "Destroying VPS", step=1)
         vps = state.get("vps")
         if vps and vps.get("id"):
@@ -460,10 +463,23 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
                         )
                     ctx.webdock.destroy_instance(vps["id"])
                 else:
-                    # Non-webdock providers fall back to legacy env-var path
                     _make_vps_client(provider).destroy_instance(vps["id"])
+                _append_log(sb, job_id, f"VPS {vps['id']} deletion requested")
             except Exception as exc:
-                _append_log(sb, job_id, f"VPS destroy warning: {exc}")
+                msg = str(exc).lower()
+                already_gone = "404" in msg or "not found" in msg or "does not exist" in msg
+                if already_gone:
+                    _append_log(sb, job_id, f"VPS {vps['id']} already gone — treating as success")
+                else:
+                    # Hard fail: leave the shard in 'destroying' so the operator
+                    # knows there's an orphan VPS to chase. Re-running destroy
+                    # is safe (idempotent on DNS + state archival).
+                    _append_log(sb, job_id, f"VPS DESTROY FAILED: {exc}")
+                    _append_log(sb, job_id,
+                        "Shard will NOT be marked destroyed. The Webdock VPS is "
+                        "likely still running and billing. Investigate in the Webdock "
+                        "dashboard or re-run destroy after fixing the underlying issue.")
+                    raise
 
         # Step 2: Delete DNS records (use the client's Cloudflare account)
         _append_log(sb, job_id, "Deleting DNS records", step=2)
