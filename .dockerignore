@@ -1,0 +1,28 @@
+# Never bake env files into the image — they belong on the host and are
+# passed at runtime via `docker run --env-file`. Otherwise load_dotenv() will
+# silently override the runtime env with whatever was in the build context.
+.env
+.env.*
+!.env.example
+!.env.v2.example
+
+# VCS + local junk
+.git
+.gitignore
+.github
+.idea
+.vscode
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+.mypy_cache
+.ruff_cache
+
+# Shard state — mounted at runtime, no need to bake the existing 21 in
+shards/
+
+# Local docs that don't need to ship
+README.md
+PARTNER_SETUP_GUIDE.md

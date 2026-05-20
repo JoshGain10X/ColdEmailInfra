@@ -27,7 +27,7 @@ from auth import verify_api_key
 from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync, run_domain_register
 from lib.client_context import load_client_context_by_slug, load_client_context_for_shard
 
-load_dotenv(override=True)
+load_dotenv()  # Do NOT override process env — docker --env-file values win
 
 app = FastAPI(title="ColdEmailInfra API", version="2.0.0")
 

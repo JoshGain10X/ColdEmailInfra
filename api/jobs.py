@@ -160,7 +160,7 @@ def run_deploy(
     rather than process env vars. Per-call request overrides still win
     (passed-in product_id/region/image_id/ssl_type override client defaults).
     """
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
@@ -434,7 +434,7 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
     import shutil
     import time
 
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
@@ -510,7 +510,7 @@ def run_verify(job_id: str, client_id: str, domain: str) -> None:
     are public), but client_id is loaded so the shard row stays scoped to
     the right tenant on update.
     """
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
@@ -786,7 +786,7 @@ def run_load_to_bison(
     """
     import time as _time
 
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
@@ -947,7 +947,7 @@ def run_domain_sync(job_id: str, client_id: str, default_client_id_for_new: str 
     """
     import time as _time
 
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
@@ -1030,7 +1030,7 @@ def run_domain_register(job_id: str, client_id: str, domain: str) -> None:
     zone lands on the right account. The domain is attributed to the
     given client in infra_domains.
     """
-    load_dotenv(override=True)
+    load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
 
