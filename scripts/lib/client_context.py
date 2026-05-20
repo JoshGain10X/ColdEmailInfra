@@ -72,6 +72,7 @@ class ClientContext:
     dmarc_rua: str
     le_email: str
     ssl_type: str
+    blocklist_webhook_url: Optional[str]
     cloudflare: CloudflareClient
     webdock: Optional[WebdockClient]
     workspaces: list[BisonWorkspace]
@@ -267,6 +268,7 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         dmarc_rua=settings.get("dmarc_rua") or f"dmarc@{default_email_host}",
         le_email=settings.get("le_email") or f"ops@{default_email_host}",
         ssl_type=settings.get("ssl_type") or "letsencrypt",
+        blocklist_webhook_url=settings.get("blocklist_webhook_url"),
         cloudflare=cf,
         webdock=webdock,
         workspaces=workspaces,

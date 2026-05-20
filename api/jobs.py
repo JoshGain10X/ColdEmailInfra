@@ -254,7 +254,9 @@ def run_deploy(
 
             inst = vps_client.wait_for_instance_ready(instance_id)
             ip = inst.get("ip")
-            blocklist.notify_check_ip(ip)
+            # Per-client blocklist webhook — skips silently if the client
+            # hasn't configured one (no leaks to other clients' monitoring).
+            blocklist.notify_check_ip(ip, ctx.blocklist_webhook_url)
             ssh_credentials = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
 
             state.set("vps", {
