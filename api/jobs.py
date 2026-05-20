@@ -389,18 +389,21 @@ def run_deploy(
             state.mark_step_done("export_bison")
         _append_log(sb, job_id, "Bison CSV exported", step=9)
 
-        # Upload CSV to Supabase Storage (non-blocking)
+        # Upload CSV to Supabase Storage, namespaced by client slug so two
+        # clients can hold the same domain without colliding in the bucket.
+        # Matches the path written by run_load_to_bison so both ends agree.
+        # Non-blocking — failures here just leave csv_storage_path NULL.
         csv_storage_path = None
         try:
             csv_file = SHARDS_DIR / f"{domain}_bison.csv"
-            storage_key = f"{domain}.csv"
+            storage_key = f"{ctx.slug}/{domain}.csv"
             with open(csv_file, "rb") as fh:
                 sb.storage.from_("shard-csvs").upload(
                     storage_key, fh.read(),
                     file_options={"content-type": "text/csv", "upsert": "true"},
                 )
             csv_storage_path = storage_key
-            _append_log(sb, job_id, "CSV uploaded to storage")
+            _append_log(sb, job_id, f"CSV uploaded to storage: {storage_key}")
         except Exception as upload_exc:
             _append_log(sb, job_id, f"CSV storage upload warning: {upload_exc}")
 
