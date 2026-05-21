@@ -770,7 +770,26 @@ def _generate_signature(first: str, last: str, email: str, company: str) -> str:
     if random.random() < 0.10:
         mobile_tags = ["Sent from my iPhone", "Sent from my mobile", "Sent from mobile"]
         sig += f"<p style=\"font-size:12px;color:#888;\">{random.choice(mobile_tags)}</p>"
-    return sig
+    return _sanitize_signature(sig)
+
+
+def _sanitize_signature(text: str) -> str:
+    """Strip em dashes (U+2014) and en dashes (U+2013) from signature
+    content before it ships into Bison.
+
+    Em dashes in cold email are an LLM-generated-copy fingerprint that
+    Gmail/Outlook classifiers flag. Almost no humans type them naturally
+    on keyboards — their presence at scale is a deliverability tell.
+
+    Belt-and-suspenders enforcement:
+    - Postgres CHECK constraints reject em dashes at INSERT/UPDATE time
+    - Both signature generators call this on their output
+    - run_load_to_bison calls this on every signature before PATCH
+
+    If em dashes ever appear in a signature in production, this is where
+    to widen the scrub.
+    """
+    return text.replace("—", "-").replace("–", "-")
 
 
 def _email_seed(email: str) -> int:
@@ -856,7 +875,7 @@ def _generate_signature_from_formula(first: str, last: str, email: str, formula)
     parts = [name_line, company_line] + middle
     if optout:
         parts.append(f"<p>{optout}</p>")
-    return "\n".join(parts)
+    return _sanitize_signature("\n".join(parts))
 
 
 def run_load_to_bison(
@@ -928,7 +947,12 @@ def run_load_to_bison(
             first = parts[0] if parts else "Team"
             last = parts[1] if len(parts) > 1 else ""
 
-            signature = _generate_signature_from_formula(first, last, email_addr, formula)
+            # Belt-and-suspenders sanitisation: even though the generator
+            # already scrubs em dashes, run it again here in case anyone
+            # ever swaps in a custom signature path that bypasses the generator.
+            signature = _sanitize_signature(
+                _generate_signature_from_formula(first, last, email_addr, formula)
+            )
 
             payload = {
                 "name": name,
