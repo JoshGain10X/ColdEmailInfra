@@ -380,7 +380,8 @@ MTASTS 200
         # Upload Caddyfile to /etc/caddy/Caddyfile (requires root)
         self.upload_text(caddyfile, "/tmp/Caddyfile.new")
         self.sudo("mv /tmp/Caddyfile.new /etc/caddy/Caddyfile")
-        self.sudo("chown root:root /etc/caddy/Caddyfile && chmod 644 /etc/caddy/Caddyfile")
+        self.sudo("chown root:root /etc/caddy/Caddyfile")
+        self.sudo("chmod 644 /etc/caddy/Caddyfile")
 
         # Start + enable
         self.sudo("systemctl enable caddy")
