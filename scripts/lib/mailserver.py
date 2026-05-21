@@ -331,19 +331,23 @@ class MailserverClient:
         after 2-4 weeks of clean operation by re-running with mode='enforce'
         or editing /etc/caddy/Caddyfile directly + `sudo systemctl reload caddy`.
         """
-        # Install Caddy from the official repo (works on Ubuntu jammy/noble).
-        # apt-key step uses the cloudsmith-hosted gpg key.
-        install_script = (
-            "apt-get update && "
-            "apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg && "
-            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
-            "  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg && "
-            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
-            "  > /etc/apt/sources.list.d/caddy-stable.list && "
-            "apt-get update && "
-            "apt-get install -y caddy"
+        # Install Caddy from the official cloudsmith repo. Each step is its
+        # own sudo call — chaining via && would only elevate the first
+        # command in the chain, and dpkg locks on a non-root caller.
+        # All steps are individually idempotent so retry on partial failure
+        # picks up cleanly.
+        self.sudo("apt-get update")
+        self.sudo("apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg")
+        self.sudo(
+            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
+            "| gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg\""
         )
-        self.sudo(install_script)
+        self.sudo(
+            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
+            "> /etc/apt/sources.list.d/caddy-stable.list\""
+        )
+        self.sudo("apt-get update")
+        self.sudo("apt-get install -y caddy")
 
         policy_lines = [
             "version: STSv1",
