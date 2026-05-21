@@ -154,6 +154,37 @@ All errors are JSON `{"detail": "<message>"}` with HTTP status:
 - `400` — Bison key validation failed / invalid request shape
 - `500` — server error (check container logs: `docker logs coldemail-api-v2`)
 
+## Upstream API quirks (Bison, Webdock, Cloudflare)
+
+These are gotchas of the systems we wrap, not our v2 API. They've cost real time during this project so they're documented here.
+
+### Email Bison
+
+- **`per_page` parameter is ignored.** Bison's `/api/sender-emails` always returns ~15 results per page regardless of `?per_page=50` etc. Iterate via `meta.last_page` to get the full set:
+  ```python
+  while page <= meta.get("last_page", 1):
+      ...
+      page += 1
+  ```
+- **PATCH `/api/sender-emails/{id}` requires `daily_limit`** alongside `email_signature`. Sending just `email_signature` returns HTTP 422 `"The daily limit field is required"`. The skill's `load-bison` includes both; ad-hoc cleanup scripts must too.
+- **Workspace API keys are per-workspace.** A "super-admin" key that lists multiple workspaces is REJECTED by `/api/bison/workspaces` (deliberate — prevents accidental cross-workspace writes). Always use the per-workspace key from Settings → API Keys inside the target workspace.
+
+### Cloudflare Registrar
+
+- **Registration is async-with-silent-failure-modes.** A POST to `/registrar/registrations` returns 202 even when the registration will ultimately fail. To know the real outcome, poll `/accounts/{acct_id}/registrar/registrations/{domain}/registration-status` which returns `state: succeeded | failed`. Our `wait_for_zone` polls `/zones?name=X` instead, which only sees the zone appear AFTER successful registration — and our timeout (20 min) is shorter than the silent-fail TTL.
+- **Two common silent-fail modes:**
+  - `error.code: 10000 "No registrant contact provided..."` → account needs default Address Book entry
+  - `error.code: billing_quote_failed` → account needs payment method
+- **Rate limit: ~5 POSTs/minute** per account. ≥15s pacing is safe; 1.5s gets you 429s. Bulk registration with parallel requests will be throttled hard.
+- **Zone activation lag**: even after a successful registration, the zone takes 10–15 min to show up in `/zones`. Our `wait_for_zone` timeout is set to 1200s (20 min) accordingly.
+
+### Webdock
+
+- **New accounts default to prepaid.** Even with a card on file, Webdock won't auto-charge a fresh account — server creation returns 400 `"Payment failed during server creation"`. Top up €20+ Service Credit before first deploy. Established accounts can be moved to post-paid via support.
+- **GET `/v1/servers` listing visibility can lag dashboard.** A server visible in the Webdock UI may return `[]` via the API and `404` on direct slug lookup, despite the same token being able to create + SSH-configure that server during deploy. Cause unconfirmed (suspected account-tier scope). Functional impact: destroy may need to fall back to dashboard. Not blocking for deploy / verify / load-bison.
+- **PTR is set via Server Identity, not a PTR-specific endpoint.** `PATCH /servers/{slug}/identity` with `{"maindomain": "mail.<domain>"}`. Webdock auto-derives BOTH IPv4 and IPv6 reverse DNS from this one setting.
+- **Webdock returns IPv6 in the create-server response** as the `ipv6` field. During early provisioning the value may be `::0` — our `_extract_ipv6` filters that out.
+
 ## Quick curl recipes
 
 ```bash

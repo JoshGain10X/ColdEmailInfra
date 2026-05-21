@@ -4,11 +4,35 @@ These are the long, multi-step flows. Walk through them step-by-step with the us
 
 ---
 
+## 0. Provider-account prerequisites (one-time per account, easy to miss)
+
+Before any new-client work, confirm the relevant provider accounts have these set up — every one of them is a "silent failure" trigger that wastes 15+ min of debugging if missing.
+
+### Cloudflare account (if it's a fresh CF account — not needed for 10x-managers CF)
+
+- ✅ **Default Address Book entry** at Manage Account → Domain Registration → Address Book → "Set as default". Without it, `/domains/register` fails with CF code 10000 `"No registrant contact provided and no default address book entry found"`.
+- ✅ **Payment method on file** at Manage Account → Billing → Payment Methods. Without it, `/domains/register` looks like it succeeds but CF silently marks the registration `state: failed` with `error.code: billing_quote_failed`. Our `wait_for_zone` then times out at 20 min showing a misleading `TimeoutError: did not become active`.
+- Verify both before bulk-registering any domains.
+
+### Webdock account (every new client gets their own)
+
+- ✅ **Service Credit topped up to ~€20** at Settings → Billing → Add Funds. New Webdock accounts default to **prepaid** mode — even with a card on file, they won't auto-charge. Without credit, `/deploy` fails at step 2 with Webdock 400 `"Payment failed during server creation"`.
+- ✅ (Optional, recommended) **Auto-recharge** enabled at Settings → Billing so the account refills when the balance drops below ~€5.
+- Established accounts (months of clean use) can be moved to post-paid by Webdock support, but expect prepaid as the default for any new account.
+
+### Cloudflare Registrar API rate limit (operational)
+
+CF Registrar caps at roughly 5 POSTs per minute per account. **Use ≥15s pacing** between `domains/register` calls if bulk-registering. The skill's `purchase` flow already paces correctly, but homegrown bulk scripts must too.
+
+---
+
 ## 1. Onboard a new client
 
 **Triggers**: "onboard <client>", "add a new cold email client", "set up <name> for cold outbound"
 
 Total time: ~15–30 min (most of it is the user fetching API keys from Webdock/Bison)
+
+**Before starting**: confirm the prerequisites in Workflow 0 are done for whichever Cloudflare account this client will use AND the new Webdock account they're creating. Skipping these costs 15–30 min of debugging later.
 
 ### Step 1 — Identity (you ask, user answers)
 
@@ -356,14 +380,74 @@ Format as a concise summary, not a data dump.
 
 ---
 
+## 7. Reattribute orphan domains to the right client
+
+**Triggers**: "we have N reachos-named domains on the 10X CF that should be under reachos", "domains attributed to wrong client", "I think there are more domains for client X"
+
+When you add domains to a Cloudflare account that hosts multiple clients (e.g. the 10X CF account hosts both 10X Managers brand AND ReachOS brand domains), `domain_sync` initially attributes new zones to `default_client_slug_for_new` (defaults to the calling client). You then need to reattribute the brand-specific ones.
+
+### Step 1 — Run a fresh sync
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $INFRA_API_KEY" -H "Content-Type: application/json" \
+  "$INFRA_API_BASE/api/domains/refresh" \
+  -d '{"client_slug":"10x-managers","default_client_slug_for_new":"10x-managers"}'
+```
+
+This pulls ALL zones from the CF account into `infra_domains`. New ones land attributed to the default; existing ones keep their existing client_id.
+
+### Step 2 — Identify by naming pattern
+
+```sql
+SELECT domain, c.slug AS attributed_to, zone_status, registrar_created_at
+FROM infra_domains d JOIN clients c ON c.id = d.client_id
+WHERE lower(domain) LIKE '%<client-name-fragment>%'
+ORDER BY domain;
+```
+
+### Step 3 — Bulk reattribute
+
+```sql
+UPDATE infra_domains
+SET client_id = (SELECT id FROM clients WHERE slug = '<target-client>')
+WHERE lower(domain) LIKE '%<pattern>%'
+  AND client_id = (SELECT id FROM clients WHERE slug = '<wrong-client>');
+```
+
+Always **eyeball the list first** before running the UPDATE — false positives are easy if the pattern is too loose. e.g. `'%reachos%'` would match `reachos.co` (their main website — don't burn it as a shard).
+
+---
+
+## Brand domain protection (always check before deploying)
+
+When you have N domains for a client, one of them is often the **main brand website**. Deploying a cold-email shard on the brand domain would burn the brand's reputation. **Always verify the target domain is NOT in `clients.website_url`** before deploying.
+
+| Client | Main brand domain — DO NOT use as a shard |
+|---|---|
+| 10x-managers | 10xmanagers.com (and `hello.10xmanagers.com` as redirect target) |
+| reachos | reachos.co |
+| scouted | scouted.tech |
+
+The skill's `deploy <client> <domain>` flow should refuse to deploy on the website domain or warn loudly. If a user explicitly asks to deploy on their brand domain, ask twice and require explicit "yes, burn it" confirmation.
+
+---
+
 ## Common failures and what to do
 
 | Failure | Cause | Recovery |
 |---|---|---|
-| Deploy fails at step 3 with Webdock 400 | Webdock token issue or quota | Check Webdock dashboard, regenerate token, update Vault secret, retry |
+| Deploy fails at step 3 with Webdock 400 — error mentions `"Payment failed during server creation"` | New Webdock account has no Service Credit OR card not enabled for auto-charge | User adds €20 Service Credit in Webdock Settings → Billing; re-run deploy (state file resumes from where it failed, no destroy needed) |
+| Deploy fails at step 3 with Webdock 400 — error is generic "Bad Request" | Webdock token issue, profile slug deprecated, or account-level quota | Direct probe: `curl -H "Authorization: Bearer <token>" https://api.webdock.io/v1/profiles?locationId=dk` to check token + profile validity |
+| Domain register fails with CF code 10000 `"No registrant contact provided..."` | CF account missing default Address Book entry | User adds one in CF dashboard → Manage Account → Domain Registration → Address Book → "Set as default" |
+| Domain register fails with TimeoutError `did not become active within 20 minutes` AND CF dashboard shows nothing under Registrar → Domains | CF account missing payment method — `billing_quote_failed`. CF accepts the POST then silently fails the registration. | User adds payment method in CF Manage Account → Billing → Payment Methods. Verify via `curl /accounts/{id}/registrar/registrations/{domain}/registration-status` — look for `state: failed, error.code: billing_quote_failed`. Then re-fire the registration. |
+| Bulk domain register: many 429s after the first 5-7 | CF Registrar API rate limit (~5 POST/min per account) | Use ≥15s pacing between calls; the skill's `purchase` flow already does this. Re-fire the failed ones. |
+| Verify TimeoutError "did not become active" on a `domain_register` job, but CF dashboard SHOWS the domain | CF zone activation slower than our 20-min `wait_for_zone` timeout. Registration succeeded, just slow. | Run `domains refresh` for that client — the sync will pick the new zone up as active. No re-register needed. |
 | Deploy fails at step 6 (mailserver install) | SSH key not on VPS, or VPS not ready yet | Re-run deploy — the state file lets it resume |
+| Deploy fails inside `install_mta_sts` with `Could not open lock file /var/lib/dpkg/lock-frontend, are you root?` | Multi-command sudo bug — chained `&&` in `self.sudo()` only elevates the first command | Fix in code: split into separate `self.sudo()` calls OR wrap in `self.sudo("sh -c '...'")`. Then retry deploy (state file resumes). |
 | Verify fails on DKIM | DNS not propagated yet | Wait 5–10 min, re-run verify |
 | Verify fails on PTR | Webdock didn't accept the rDNS request | Check via SSH to VPS; manually set in Webdock dashboard if needed |
-| Load-bison fails "CSV not found" | Shard wasn't deployed cleanly | Re-run deploy first; CSV is generated in step 9 |
-| Domain register fails after 10 min timeout | CF Registrar slow — registration usually still succeeded | Wait 5 more min, check `domains` — likely showing as active |
+| Load-bison fails "CSV not found" | Shard wasn't deployed cleanly OR `shard-csvs` Storage bucket missing in the Supabase project | `SELECT * FROM storage.buckets WHERE id='shard-csvs'` — if empty, create it (private, text/csv, 10MB). For an existing shard with `csv_storage_path=NULL`, re-run deploy (it resumes at step 9). |
+| Load-bison PATCH calls return HTTP 422 `"The daily limit field is required"` | Bison's PATCH /api/sender-emails/{id} requires `daily_limit` alongside `email_signature` | Include both fields in the PATCH body. The skill's load-bison code already does this; ad-hoc cleanup scripts often miss it. |
+| Webdock dashboard shows the VPS but `GET /v1/servers` returns `[]` with the same token | Account-tier visibility quirk — token can create but not list under certain account configurations | Functional impact: none for verify/load-bison; possible problem for destroy. Workaround: use the dashboard's destroy. Worth investigating token scopes in Webdock UI but not blocking. |
+| Cleanup script ran but signatures still show em dashes | Likely failed at HTTP 422 (missing daily_limit) — script reports 0 patched, N errors | Read the script's error logs. Include `daily_limit` from the existing sender object in every PATCH payload. |
 | `Invalid API key` on every call | INFRA_API_KEY mismatch or .env not loaded | `source ~/.claude/skills/cold-email-infra/.env` first |
