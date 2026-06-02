@@ -941,7 +941,10 @@ def run_load_to_bison(
             imap_port = int(row.get("IMAP Port", "993"))
             smtp_server = row.get("SMTP Server", "")
             smtp_port = int(row.get("SMTP Port", "465"))
-            daily_limit = int(row.get("Daily Limit", "10"))
+            # Default daily_limit=1 for fresh mailboxes. The bison-deliverability
+            # skill runs a daily ramp cron that increments to a cap of 10. If the
+            # CSV row sets an explicit Daily Limit, that wins (manual override).
+            daily_limit = int(row.get("Daily Limit", "1"))
 
             parts = name.strip().split(" ", 1)
             first = parts[0] if parts else "Team"
