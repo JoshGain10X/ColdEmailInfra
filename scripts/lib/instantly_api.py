@@ -51,7 +51,12 @@ def create_account(
     smtp_host: str, smtp_port: int,
     username: str, password: str,
     first_name: str = "", last_name: str = "",
+    warmup_custom_ftag: str | None = None,
 ) -> dict:
+    """Create a custom IMAP/SMTP account. `warmup_custom_ftag` should be the
+    workspace's Bison warmup_filter_phrase so Bison recognises peer warmup
+    mail and excludes it from reply stats. Falls back to the legacy universal
+    tag for backwards compat (still works as a no-op against Bison's filter)."""
     payload = {
         "email": email,
         "first_name": first_name,
@@ -65,12 +70,11 @@ def create_account(
         "smtp_password": password,
         "smtp_host": smtp_host,
         "smtp_port": int(smtp_port),
-        # Configure warmup settings inline so peer mail carries the filter
-        # tag from the very first warmup send. The Dovecot Sieve filter
-        # routes anything with `WARMUP_FILTER_TAG` in Subject to a Warmup/
-        # folder so Bison's IMAP poller never sees it as a "reply".
+        # Warmup settings inline. warmup_custom_ftag must match the workspace's
+        # Bison warmup_filter_phrase so Bison's IMAP poller recognises peer
+        # warmup mail natively and excludes it from reply stats.
         "warmup": {
-            "warmup_custom_ftag": WARMUP_FILTER_TAG,
+            "warmup_custom_ftag": warmup_custom_ftag or WARMUP_FILTER_TAG,
             "limit": DEFAULT_WARMUP_DAILY_LIMIT,
             "increment": DEFAULT_WARMUP_INCREMENT,
             "reply_rate": DEFAULT_WARMUP_REPLY_RATE,
