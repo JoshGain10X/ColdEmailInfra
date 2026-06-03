@@ -69,6 +69,41 @@ class MailserverClient:
         """Restart the docker-mailserver container (used after DKIM keygen)."""
         self.sudo(f"sh -c 'cd {self._workdir()} && docker compose restart mailserver'")
 
+    def install_warmup_sieve(self, restart: bool = True) -> None:
+        """Install the global Sieve filter that routes Instantly warmup peer
+        mail (subject contains 'sointerested') into a Warmup/ folder, so it
+        never reaches INBOX where Bison would mistake it for a real reply.
+
+        Idempotent: re-running just overwrites the file with the same content.
+        Caller usually wants restart=True so the new filter takes effect; pass
+        False when chaining multiple changes that share a single restart.
+        """
+        wd = self._workdir()
+        # docker-mailserver expects before.dovecot.sieve in <workdir>/config/
+        # and reads it at container start (or on `setup config dkim` runs).
+        sieve_content = (
+            'require ["fileinto", "mailbox"];\n'
+            '\n'
+            'if header :contains "Subject" "sointerested" {\n'
+            '  fileinto :create "Warmup";\n'
+            '  stop;\n'
+            '}\n'
+        )
+        # Heredoc into the target path. Use printf to avoid shell-quoting issues.
+        encoded = sieve_content.replace("'", "'\\''")
+        cmd = (
+            f"mkdir -p {wd}/config && "
+            f"printf '%s' '{encoded}' > {wd}/config/before.dovecot.sieve"
+        )
+        self.run(cmd)
+        # Ensure ENABLE_MANAGESIEVE=1 in mailserver.env (in case the shard was
+        # provisioned with the old default).
+        self.run(
+            f"sed -i 's/^ENABLE_MANAGESIEVE=0/ENABLE_MANAGESIEVE=1/' {wd}/mailserver.env || true"
+        )
+        if restart:
+            self.restart_mailserver()
+
     def run(self, cmd: str, check: bool = True) -> tuple[int, str, str]:
         assert self.ssh is not None
         stdin, stdout, stderr = self.ssh.exec_command(cmd)

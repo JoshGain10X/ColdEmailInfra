@@ -591,6 +591,35 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
 # VERIFY
 # ---------------------------------------------------------------------------
 
+def run_install_sieve(job_id: str, client_id: str, domain: str) -> None:
+    """Install the warmup-isolation Sieve filter on an existing shard's
+    mailserver. Used to backfill shards deployed before the filter was
+    added at provisioning time. Idempotent.
+    """
+    load_dotenv()
+    sb = _supabase()
+    _update_job(sb, job_id, status="running")
+    try:
+        shard_row = sb.table("infra_shards").select("vps_ip").eq("domain", domain).limit(1).execute()
+        if not shard_row.data or not shard_row.data[0].get("vps_ip"):
+            raise RuntimeError(f"no infra_shards row with vps_ip for {domain}")
+        vps_ip = shard_row.data[0]["vps_ip"]
+        _append_log(sb, job_id, f"Connecting to {vps_ip}", step=1)
+        from lib.mailserver import MailserverClient as _MS
+        state = ShardState(domain)
+        ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
+        ssh_user = _ssh_user(state)
+        ms = _MS(vps_ip, ssh_key, user=ssh_user)
+        ms.connect()
+        _append_log(sb, job_id, "Installing warmup Sieve filter + restarting mailserver", step=2)
+        ms.install_warmup_sieve(restart=True)
+        _append_log(sb, job_id, "ok")
+        _update_job(sb, job_id, status="completed", completed_at=datetime.now(timezone.utc).isoformat())
+    except Exception as exc:
+        _append_log(sb, job_id, f"Sieve install failed: {exc}")
+        _update_job(sb, job_id, status="failed", error=str(exc), completed_at=datetime.now(timezone.utc).isoformat())
+
+
 def run_verify(job_id: str, client_id: str, domain: str) -> None:
     """Run verification checks — called as a background task.
 
@@ -989,6 +1018,50 @@ def run_load_to_bison(
                         )
                     except Exception:
                         pass  # Non-blocking — signature is nice-to-have
+
+                    # Push to Instantly for warmup (non-blocking on failure).
+                    # Failure here just means the warmup-poller cron on the
+                    # bison-deliverability host will pick it up later via
+                    # status='enable_failed', or the backfill script does.
+                    try:
+                        from datetime import timedelta as _td
+                        from lib.instantly_api import create_account as _ic, enable_warmup as _iw
+                        _ws_id = int(target_ws.workspace_id) if target_ws.workspace_id else None
+                        _domain = email_addr.split("@", 1)[1].lower()
+                        # root = last two dot-segments (sufficient for our .com/.co/.org domains)
+                        _parts = _domain.split(".")
+                        _root = ".".join(_parts[-2:]) if len(_parts) >= 2 else _domain
+                        _row = {
+                            "workspace_id": _ws_id,
+                            "workspace_name": ws_name,
+                            "bison_sender_email_id": int(sender_id),
+                            "email": email_addr.lower(),
+                            "domain": _domain,
+                            "root_domain": _root,
+                            "instantly_account_id": email_addr.lower(),
+                            "initial_warmup_ends_at": (datetime.now(timezone.utc) + _td(days=14)).isoformat(),
+                        }
+                        try:
+                            _ic(
+                                email=email_addr,
+                                imap_host=imap_server, imap_port=imap_port,
+                                smtp_host=smtp_server, smtp_port=smtp_port,
+                                username=email_addr, password=password,
+                                first_name=first, last_name=last,
+                            )
+                            _iw([email_addr])
+                            _row["status"] = "initial_warmup"
+                            sb.table("instantly_warmup_state").insert(_row).execute()
+                        except Exception as instantly_exc:
+                            _row["status"] = "enable_failed"
+                            _row["last_error"] = str(instantly_exc)[:500]
+                            try:
+                                sb.table("instantly_warmup_state").insert(_row).execute()
+                            except Exception:
+                                pass
+                    except Exception:
+                        # Defensive: never let Instantly push break the Bison load loop
+                        pass
             except Exception as exc:
                 failed += 1
                 if i <= 3 or failed <= 3:
@@ -1003,6 +1076,27 @@ def run_load_to_bison(
                 _time.sleep(0.5)
 
         _append_log(sb, job_id, f"Created {len(created_ids)}/{len(rows)} senders", step=4)
+
+        # Install the warmup-isolation Sieve filter on this shard's mailserver.
+        # Idempotent: writes/overwrites <workdir>/config/before.dovecot.sieve
+        # and restarts docker-mailserver to pick it up. Non-blocking on
+        # failure - the load itself is fine; Sieve can be retried via the
+        # /api/sieve/install/{domain} endpoint.
+        try:
+            shard_row = sb.table("infra_shards").select("vps_ip").eq("domain", domain).limit(1).execute()
+            shard_data = shard_row.data[0] if shard_row.data else None
+            if shard_data and shard_data.get("vps_ip"):
+                from lib.mailserver import MailserverClient as _MS
+                _state = ShardState(domain)
+                _ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
+                _ssh_user_local = _ssh_user(_state)
+                _append_log(sb, job_id, "Installing warmup Sieve filter")
+                _ms = _MS(shard_data["vps_ip"], _ssh_key, user=_ssh_user_local)
+                _ms.connect()
+                _ms.install_warmup_sieve(restart=True)
+                _append_log(sb, job_id, "Sieve filter installed")
+        except Exception as sieve_exc:
+            _append_log(sb, job_id, f"Sieve install warning: {sieve_exc}")
 
         # Tag all created senders
         if created_ids:
