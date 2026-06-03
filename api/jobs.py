@@ -945,6 +945,21 @@ def run_load_to_bison(
         chosen_token = target_ws._api_key  # used directly only for PATCH below
         formula = ctx.signature_for_workspace(target_ws.id)
 
+        # Per-workspace Bison warmup_filter_phrase. Instantly's warmup_custom_ftag
+        # must equal this so Bison's IMAP poller excludes warmup mail from reply
+        # stats. Falls back to None if we can't read it - the create payload
+        # then uses the wrapper's default and we accept a small stats-pollution
+        # window until the warmup-poller / a manual rekey corrects it.
+        ws_warmup_phrase: str | None = None
+        try:
+            ws_list = bison.get_workspaces() or []
+            for ws in ws_list:
+                if str(ws.get("id")) == str(target_ws.workspace_id):
+                    ws_warmup_phrase = (ws.get("warmup_filter_phrase") or "").strip() or None
+                    break
+        except Exception:
+            pass
+
         _append_log(sb, job_id, f"Target workspace: {ws_name} (client: {ctx.slug})", step=2)
 
         # Read CSV rows
@@ -1048,6 +1063,7 @@ def run_load_to_bison(
                                 smtp_host=smtp_server, smtp_port=smtp_port,
                                 username=email_addr, password=password,
                                 first_name=first, last_name=last,
+                                warmup_custom_ftag=ws_warmup_phrase,
                             )
                             _iw([email_addr])
                             _row["status"] = "initial_warmup"
