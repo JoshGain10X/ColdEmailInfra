@@ -24,7 +24,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from auth import verify_api_key
-from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync, run_domain_register
+from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync, run_domain_register, run_install_sieve
 from lib.client_context import load_client_context_by_slug, load_client_context_for_shard
 
 load_dotenv()  # Do NOT override process env — docker --env-file values win
@@ -203,6 +203,22 @@ def verify(domain: str, bg: BackgroundTasks, req: Optional[ActionRequest] = None
         client_id = _resolve_client_id_from_domain(domain)
     job_id = _create_job("verify", client_id, domain, total_steps=5, created_by=created_by)
     bg.add_task(run_verify, job_id, client_id, domain)
+    return {"job_id": job_id, "domain": domain, "status": "pending"}
+
+
+@app.post("/api/sieve/install/{domain}")
+def install_sieve(domain: str, bg: BackgroundTasks, req: Optional[ActionRequest] = None, _: str = Depends(verify_api_key)):
+    """Backfill the warmup-isolation Sieve filter on an existing shard's
+    mailserver. New deploys already install this at load-to-bison time; this
+    endpoint is for shards provisioned before the filter was added.
+    """
+    created_by = req.created_by if req else None
+    if req and req.client_slug:
+        client_id = _resolve_client_id(req.client_slug)
+    else:
+        client_id = _resolve_client_id_from_domain(domain)
+    job_id = _create_job("install_sieve", client_id, domain, total_steps=2, created_by=created_by)
+    bg.add_task(run_install_sieve, job_id, client_id, domain)
     return {"job_id": job_id, "domain": domain, "status": "pending"}
 
 
