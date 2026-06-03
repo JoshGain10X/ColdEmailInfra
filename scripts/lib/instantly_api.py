@@ -65,6 +65,16 @@ def create_account(
         "smtp_password": password,
         "smtp_host": smtp_host,
         "smtp_port": int(smtp_port),
+        # Configure warmup settings inline so peer mail carries the filter
+        # tag from the very first warmup send. The Dovecot Sieve filter
+        # routes anything with `WARMUP_FILTER_TAG` in Subject to a Warmup/
+        # folder so Bison's IMAP poller never sees it as a "reply".
+        "warmup": {
+            "warmup_custom_ftag": WARMUP_FILTER_TAG,
+            "limit": DEFAULT_WARMUP_DAILY_LIMIT,
+            "increment": DEFAULT_WARMUP_INCREMENT,
+            "reply_rate": DEFAULT_WARMUP_REPLY_RATE,
+        },
     }
     r = requests.post(
         f"{INSTANTLY_BASE_URL}/accounts",
