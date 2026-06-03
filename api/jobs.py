@@ -976,6 +976,10 @@ def run_load_to_bison(
         # Create each sender individually with formula-driven signature
         created_ids = []
         failed = 0
+        # (email, bison_sender_email_id) pairs awaiting a single batched
+        # enable_warmup call after the loop. See loader-side concurrency note
+        # below for why this is deferred.
+        instantly_pending: list[tuple[str, int]] = []
 
         for i, row in enumerate(rows, 1):
             name = row.get("Name", "")
@@ -1034,13 +1038,15 @@ def run_load_to_bison(
                     except Exception:
                         pass  # Non-blocking — signature is nice-to-have
 
-                    # Push to Instantly for warmup (non-blocking on failure).
-                    # Failure here just means the warmup-poller cron on the
-                    # bison-deliverability host will pick it up later via
-                    # status='enable_failed', or the backfill script does.
+                    # Push to Instantly for warmup. Creation is per-sender (sets
+                    # imap/smtp + warmup_custom_ftag inline). enable_warmup is
+                    # DEFERRED to a single batch call after the loop: Instantly
+                    # serialises warmup-update jobs per-account, so 100 sequential
+                    # single-email enables collide on 409 ("update-warmup-accounts
+                    # job in progress"). One batch call avoids the self-collision.
                     try:
                         from datetime import timedelta as _td
-                        from lib.instantly_api import create_account as _ic, enable_warmup as _iw
+                        from lib.instantly_api import create_account as _ic
                         _ws_id = int(target_ws.workspace_id) if target_ws.workspace_id else None
                         _domain = email_addr.split("@", 1)[1].lower()
                         # root = last two dot-segments (sufficient for our .com/.co/.org domains)
@@ -1065,9 +1071,9 @@ def run_load_to_bison(
                                 first_name=first, last_name=last,
                                 warmup_custom_ftag=ws_warmup_phrase,
                             )
-                            _iw([email_addr])
-                            _row["status"] = "initial_warmup"
+                            _row["status"] = "pending_enable"
                             sb.table("instantly_warmup_state").insert(_row).execute()
+                            instantly_pending.append((email_addr.lower(), int(sender_id)))
                         except Exception as instantly_exc:
                             _row["status"] = "enable_failed"
                             _row["last_error"] = str(instantly_exc)[:500]
@@ -1092,6 +1098,57 @@ def run_load_to_bison(
                 _time.sleep(0.5)
 
         _append_log(sb, job_id, f"Created {len(created_ids)}/{len(rows)} senders", step=4)
+
+        # Batch-enable warmup on Instantly for all newly-created accounts.
+        # Single POST /accounts/warmup/enable with all emails avoids the
+        # 409 self-collision the per-sender loop used to cause. Retry on 409
+        # with backoff in case another workspace's job is mid-flight.
+        if instantly_pending:
+            _append_log(
+                sb,
+                job_id,
+                f"Enabling warmup on Instantly for {len(instantly_pending)} accounts (batch)",
+            )
+            try:
+                from lib.instantly_api import enable_warmup as _iw
+                _pending_emails = [e for e, _ in instantly_pending]
+                _pending_ids = [sid for _, sid in instantly_pending]
+                _now_iso = datetime.now(timezone.utc).isoformat()
+                _enabled = False
+                _last_err: str | None = None
+                for _attempt in range(1, 7):  # up to ~7 minutes total
+                    try:
+                        _iw(_pending_emails)
+                        _enabled = True
+                        break
+                    except Exception as _exc:
+                        _last_err = str(_exc)[:300]
+                        _is_409 = "409" in _last_err
+                        if _is_409 and _attempt < 6:
+                            _append_log(
+                                sb,
+                                job_id,
+                                f"Warmup-enable 409 (attempt {_attempt}); sleeping 60s and retrying",
+                            )
+                            _time.sleep(60)
+                            continue
+                        break
+                if _enabled:
+                    sb.table("instantly_warmup_state").update(
+                        {"status": "initial_warmup", "warmup_enabled_at": _now_iso, "last_error": None}
+                    ).in_("bison_sender_email_id", _pending_ids).execute()
+                    _append_log(sb, job_id, f"Warmup enabled on {len(_pending_ids)} accounts")
+                else:
+                    sb.table("instantly_warmup_state").update(
+                        {"status": "enable_failed", "last_error": _last_err}
+                    ).in_("bison_sender_email_id", _pending_ids).execute()
+                    _append_log(
+                        sb,
+                        job_id,
+                        f"Warmup batch-enable failed; {len(_pending_ids)} stuck in enable_failed: {_last_err}",
+                    )
+            except Exception as _batch_exc:
+                _append_log(sb, job_id, f"Warmup batch-enable warning: {_batch_exc}")
 
         # Install the warmup-isolation Sieve filter on this shard's mailserver.
         # Idempotent: writes/overwrites <workdir>/config/before.dovecot.sieve
