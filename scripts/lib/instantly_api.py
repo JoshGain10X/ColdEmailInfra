@@ -16,7 +16,11 @@ from typing import Iterable
 import requests
 
 INSTANTLY_BASE_URL = "https://api.instantly.ai/api/v2"
-PROVIDER_CODE_CUSTOM_SMTP = 2
+# Instantly provider codes (per api.instantly.ai/openapi/api_v2.json):
+#   1 = Custom IMAP/SMTP   <- what we want
+#   2 = Google (OAuth)
+#   3 = Microsoft (OAuth)
+PROVIDER_CODE_CUSTOM_SMTP = 1
 
 # Warmup defaults applied at create time. Bison-deliverability skill's
 # instantly_admin.py uses the same values.
