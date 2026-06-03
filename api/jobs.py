@@ -1062,15 +1062,33 @@ def run_load_to_bison(
                             "instantly_account_id": email_addr.lower(),
                             "initial_warmup_ends_at": (datetime.now(timezone.utc) + _td(days=14)).isoformat(),
                         }
+                        # Instantly's create_account does a live IMAP login against
+                        # the shard mailserver. Observed: ~25% transient
+                        # "IMAP connection failed" when Instantly verifies
+                        # immediately after docker-mailserver registers the
+                        # user. Retry 2x with 15s backoff to ride out that.
+                        _ic_exc: Exception | None = None
+                        for _ic_attempt in range(3):
+                            try:
+                                _ic(
+                                    email=email_addr,
+                                    imap_host=imap_server, imap_port=imap_port,
+                                    smtp_host=smtp_server, smtp_port=smtp_port,
+                                    username=email_addr, password=password,
+                                    first_name=first, last_name=last,
+                                    warmup_custom_ftag=ws_warmup_phrase,
+                                )
+                                _ic_exc = None
+                                break
+                            except Exception as _e:
+                                _ic_exc = _e
+                                if "IMAP connection failed" in str(_e) and _ic_attempt < 2:
+                                    _time.sleep(15)
+                                    continue
+                                break
                         try:
-                            _ic(
-                                email=email_addr,
-                                imap_host=imap_server, imap_port=imap_port,
-                                smtp_host=smtp_server, smtp_port=smtp_port,
-                                username=email_addr, password=password,
-                                first_name=first, last_name=last,
-                                warmup_custom_ftag=ws_warmup_phrase,
-                            )
+                            if _ic_exc:
+                                raise _ic_exc
                             _row["status"] = "pending_enable"
                             sb.table("instantly_warmup_state").insert(_row).execute()
                             instantly_pending.append((email_addr.lower(), int(sender_id)))
