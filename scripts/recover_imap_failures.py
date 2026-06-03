@@ -105,14 +105,25 @@ def main() -> int:
         bison = ws.client()
         # warmup_filter_phrase comes from Bison's /workspaces endpoint, not
         # the local DB. Mirror api/jobs.py's lookup.
-        phrase = "sointerested"
+        # IMPORTANT: fail loud if we can't resolve the per-workspace phrase
+        # — the previous "sointerested" fallback silently broke Sieve
+        # filtering for recovered senders (warmup mail landed in inbox).
+        phrase: str | None = None
         try:
             for w in bison.get_workspaces() or []:
                 if str(w.get("id")) == str(ws.workspace_id):
-                    phrase = (w.get("warmup_filter_phrase") or "").strip() or phrase
+                    phrase = (w.get("warmup_filter_phrase") or "").strip() or None
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            raise SystemExit(
+                f"FATAL: cannot fetch workspaces from Bison for ws={ws.workspace_id}: {e}. "
+                f"Refusing to fall back to universal 'sointerested' tag — that breaks the Sieve filter."
+            )
+        if not phrase:
+            raise SystemExit(
+                f"FATAL: Bison workspace {ws.workspace_id} has no warmup_filter_phrase. "
+                f"Refusing to push to Instantly with wrong tag — fix the workspace first."
+            )
         ws_cache[int(ws.workspace_id)] = (bison, phrase)
 
     succeeded_ids: list[int] = []
