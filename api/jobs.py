@@ -1114,9 +1114,15 @@ def run_load_to_bison(
                 _pending_emails = [e for e, _ in instantly_pending]
                 _pending_ids = [sid for _, sid in instantly_pending]
                 _now_iso = datetime.now(timezone.utc).isoformat()
+                # Instantly's update-warmup-accounts lock has been observed to
+                # hold continuously for 25+ minutes during cross-batch contention
+                # (other workspace's batch still being processed). Budget 30
+                # attempts × 60s = 30 min, then fall back to enable_failed so the
+                # warmup-poller cron on the bison-deliverability host can retry.
                 _enabled = False
                 _last_err: str | None = None
-                for _attempt in range(1, 7):  # up to ~7 minutes total
+                _max_attempts = 30
+                for _attempt in range(1, _max_attempts + 1):
                     try:
                         _iw(_pending_emails)
                         _enabled = True
@@ -1124,12 +1130,13 @@ def run_load_to_bison(
                     except Exception as _exc:
                         _last_err = str(_exc)[:300]
                         _is_409 = "409" in _last_err
-                        if _is_409 and _attempt < 6:
-                            _append_log(
-                                sb,
-                                job_id,
-                                f"Warmup-enable 409 (attempt {_attempt}); sleeping 60s and retrying",
-                            )
+                        if _is_409 and _attempt < _max_attempts:
+                            if _attempt == 1 or _attempt % 5 == 0:
+                                _append_log(
+                                    sb,
+                                    job_id,
+                                    f"Warmup-enable 409 (attempt {_attempt}/{_max_attempts}); sleeping 60s and retrying",
+                                )
                             _time.sleep(60)
                             continue
                         break
