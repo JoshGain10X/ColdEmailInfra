@@ -513,15 +513,31 @@ MTASTS 200
         return self._parse_dkim_txt(out)
 
     def _ensure_opendkim_trustedhosts(self) -> None:
-        # `setup config dkim` ships an empty TrustedHosts, which makes opendkim
-        # treat the container's own internal IP as external and skip signing on
-        # outbound mail. Postfix milter still calls opendkim, opendkim sees the
-        # source as untrusted, and the message goes out unsigned. Write the
-        # standard docker-mailserver defaults and restart opendkim so the new
-        # rules take effect before the next mail is sent.
-        path = f"{self._workdir()}/docker-data/dms/config/opendkim/TrustedHosts"
+        # `setup config dkim` writes its outputs to /tmp/docker-mailserver/opendkim/
+        # (the host-mounted config) but opendkim itself reads from /etc/opendkim/
+        # inside the container. docker-mailserver only copies between those two
+        # locations during full container init — not on opendkim service restart.
+        # Plus the TrustedHosts file ships empty, so without this routine
+        # outbound mail goes UNSIGNED even when DNS DKIM records look perfect.
+        # Fix: write TrustedHosts, copy {SigningTable, KeyTable, TrustedHosts,
+        # keys/} into /etc/opendkim/, fix opendkim ownership/perms, restart.
+        host_path = f"{self._workdir()}/docker-data/dms/config/opendkim/TrustedHosts"
         body = "127.0.0.1\nlocalhost\n::1\n172.16.0.0/12\n192.168.0.0/16\n10.0.0.0/8\n"
-        self.sudo(f"bash -c \"cat > {path} <<'EOF'\n{body}EOF\"")
+        self.sudo(f"bash -c \"cat > {host_path} <<'EOF'\n{body}EOF\"")
+        self.sudo(
+            "docker exec mailserver bash -c '"
+            "cp /tmp/docker-mailserver/opendkim/SigningTable /etc/opendkim/SigningTable; "
+            "cp /tmp/docker-mailserver/opendkim/KeyTable /etc/opendkim/KeyTable; "
+            "cp /tmp/docker-mailserver/opendkim/TrustedHosts /etc/opendkim/TrustedHosts; "
+            "rm -rf /etc/opendkim/keys; "
+            "cp -r /tmp/docker-mailserver/opendkim/keys /etc/opendkim/keys; "
+            "chown -R opendkim:opendkim /etc/opendkim/keys; "
+            "chmod 700 /etc/opendkim/keys; "
+            "find /etc/opendkim/keys -type d -exec chmod 700 {} +; "
+            "find /etc/opendkim/keys -type f -name mail.private -exec chmod 600 {} +"
+            "'",
+            check=False,
+        )
         self.sudo("docker exec mailserver supervisorctl restart opendkim", check=False)
 
     @staticmethod
