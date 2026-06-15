@@ -507,9 +507,22 @@ MTASTS 200
             f"docker exec mailserver setup config dkim keysize {keysize} domain {subdomain_fqdn}",
             check=False,
         )
+        self._ensure_opendkim_trustedhosts()
         remote_path = f"{self._workdir()}/docker-data/dms/config/opendkim/keys/{subdomain_fqdn}/mail.txt"
         _, out, _ = self.sudo(f"cat {remote_path}")
         return self._parse_dkim_txt(out)
+
+    def _ensure_opendkim_trustedhosts(self) -> None:
+        # `setup config dkim` ships an empty TrustedHosts, which makes opendkim
+        # treat the container's own internal IP as external and skip signing on
+        # outbound mail. Postfix milter still calls opendkim, opendkim sees the
+        # source as untrusted, and the message goes out unsigned. Write the
+        # standard docker-mailserver defaults and restart opendkim so the new
+        # rules take effect before the next mail is sent.
+        path = f"{self._workdir()}/docker-data/dms/config/opendkim/TrustedHosts"
+        body = "127.0.0.1\nlocalhost\n::1\n172.16.0.0/12\n192.168.0.0/16\n10.0.0.0/8\n"
+        self.sudo(f"bash -c \"cat > {path} <<'EOF'\n{body}EOF\"")
+        self.sudo("docker exec mailserver supervisorctl restart opendkim", check=False)
 
     @staticmethod
     def _parse_dkim_txt(raw: str) -> str:
