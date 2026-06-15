@@ -1,0 +1,7 @@
+# Per-shard DMARC report poller. Runs every 30 min. Each tick:
+#   1) reads infra_shards (status IN active,verified) from Supabase
+#   2) opens IMAP at dmarc@<sub>.<root> on each shard's mail VPS
+#   3) parses aggregate + forensic reports via parsedmarc
+#   4) upserts structured rows into dmarc_aggregate_reports / _records /
+#      _forensic_reports; logs the cron tick into dmarc_ingest_runs
+*/30 * * * * /usr/local/bin/python /app/dmarc/dmarc_poll.py

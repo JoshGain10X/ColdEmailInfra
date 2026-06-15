@@ -21,6 +21,7 @@ class ShardState:
                 "vps": {},
                 "dkim": {},
                 "dns_record_ids": {},
+                "dmarc_inbox": "",
             }
 
     def save(self) -> None:

@@ -38,7 +38,7 @@ from lib.client_context import (
 )
 from lib.cloudflare import CloudflareClient
 from lib.contabo import ContaboClient
-from lib.generate import generate_mailboxes, pick_subdomains
+from lib.generate import SHARED_MAILBOX_PASSWORD, generate_mailboxes, pick_subdomains
 from lib.mailserver import MailserverClient
 from lib.state import ShardState, SHARDS_DIR
 from lib.webdock import WebdockClient
@@ -224,6 +224,12 @@ def run_deploy(
             state.set("subdomains", subs)
             state.set("mailbox_seed", seed)
             state.set("mailboxes", mailboxes)
+            # Pin the DMARC inbox to subdomains[0] (alphabetical) at generate
+            # time and never recompute. The mailbox itself is created in a
+            # dedicated step later; the DMARC TXT records reference this
+            # address from configure_dns onwards. Same Organizational Domain
+            # as senders, so no RFC 7489 §7.1 EDV needed.
+            state.set("dmarc_inbox", f"dmarc@{sorted(subs)[0]}.{domain}")
             state.mark_step_done("generate")
         mailbox_mode = "single-persona" if ctx.mailbox_local_parts else "multi-persona"
         _append_log(sb, job_id,
@@ -307,7 +313,11 @@ def run_deploy(
             vps_ip = vps_state["ip"]
             vps_ip6 = vps_state.get("ip6")  # None on Webdock plans without v6
             subs = state.get("subdomains")
-            dmarc_rua = ctx.dmarc_rua or f"dmarc@{domain}"
+            # rua resolves to the shard-local dmarc inbox pinned at generate
+            # time. Same Organizational Domain as senders → no EDV. Fallback
+            # to ctx.dmarc_rua only for backward compat with shards generated
+            # before the inbox-pinning step existed.
+            dmarc_rua = state.get("dmarc_inbox") or ctx.dmarc_rua or f"dmarc@{domain}"
             redirect_target = ctx.redirect_url or f"https://{domain}"
             mail_host = _mail_hostname(domain)
 
@@ -409,6 +419,24 @@ def run_deploy(
                 ms.close()
             state.mark_step_done("create_mailboxes")
         _append_log(sb, job_id, "Mailboxes created", step=7)
+
+        # Step 6.1: Create DMARC inbox. Lives at dmarc@<subdomains[0]>.<root>
+        # — same Organizational Domain as senders → no EDV needed for the rua
+        # we wrote in configure_dns. Excluded from state["mailboxes"] so it
+        # never gets exported to Bison or loaded as an outbound sender.
+        if not state.is_step_done("create_dmarc_inbox"):
+            dmarc_inbox = state.get("dmarc_inbox")
+            if dmarc_inbox:
+                _append_log(sb, job_id, f"Creating DMARC inbox {dmarc_inbox}")
+                ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
+                ms.connect()
+                try:
+                    ms.wait_for_mailserver_ready()
+                    ms.add_mailbox(dmarc_inbox, SHARED_MAILBOX_PASSWORD)
+                finally:
+                    ms.close()
+            state.mark_step_done("create_dmarc_inbox")
+        _append_log(sb, job_id, "DMARC inbox ready")
 
         # Step 6.5: Install MTA-STS policy server (Caddy on the mail VPS)
         # Runs after mailserver install + before DKIM so the policy URL is

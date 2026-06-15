@@ -269,6 +269,11 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         mailbox_count=int(settings.get("mailbox_count") or 100),
         subdomain_count=int(settings.get("subdomain_count") or 20),
         default_daily_limit=int(settings.get("default_daily_limit") or 10),
+        # NOTE 2026-06-15: ctx.dmarc_rua is now only a fallback for legacy
+        # shards generated before state["dmarc_inbox"] existed. New deploys
+        # and retrofitted shards pin a per-shard `dmarc@<sub>.<root>` inbox
+        # at generate time and use that in the DMARC rua records instead.
+        # Setting client_settings.dmarc_rua no longer affects new deploys.
         dmarc_rua=settings.get("dmarc_rua") or f"dmarc@{default_email_host}",
         le_email=settings.get("le_email") or f"ops@{default_email_host}",
         ssl_type=settings.get("ssl_type") or "letsencrypt",
