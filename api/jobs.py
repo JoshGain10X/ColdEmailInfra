@@ -1638,6 +1638,22 @@ def run_placement_test(
         vps_ip = (state.get("vps") or {}).get("ip")
         if not vps_ip:
             raise RuntimeError("shard has no vps_ip")
+
+        # 2a. Pre-flight reachability check on port 22. If the VPS is dead /
+        # the state file is stale, we'd otherwise create the EmailGuard test
+        # (burning a quota slot) and then hang on the SSH attempt for minutes
+        # before failing. Fail fast instead.
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.settimeout(8.0)
+            try:
+                _s.connect((vps_ip, 22))
+            except (_socket.timeout, OSError) as _exc:
+                raise RuntimeError(
+                    f"VPS {vps_ip} is unreachable on port 22 ({_exc}). "
+                    "Shard state file may be stale or VPS torn down. "
+                    "No EmailGuard quota was used."
+                )
         mailboxes = state.get("mailboxes") or []
         dmarc_inbox = state.get("dmarc_inbox")
         candidates = [m for m in mailboxes if m.get("email") and m.get("email") != dmarc_inbox]
