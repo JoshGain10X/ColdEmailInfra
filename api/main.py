@@ -161,6 +161,39 @@ class PlacementTestRequest(BaseModel):
     created_by: Optional[str] = None
 
 
+class SpamhausAdHocRequest(BaseModel):
+    """Trigger any of the 5 Spamhaus Intelligence checks ad-hoc.
+
+    Credit costs (per EmailGuard's pricing page):
+      - domain_reputation:    4 credits (bundles 4 sub-checks)
+      - nameserver_reputation: 1 credit
+      - a_record_reputation:   1 credit
+      - domain_senders:        1 credit
+      - domain_context:        1 credit
+
+    Monthly Spamhaus pool: 75 credits. Caller is responsible for quota
+    management — this endpoint will happily run the check even if it
+    pushes the account into the next billing tier.
+    """
+    check_type: str
+    domain: str
+    shard_domain: Optional[str] = None
+    client_slug: Optional[str] = None
+
+
+class SpamhausFleetScanRequest(BaseModel):
+    """Bulk-trigger a Spamhaus check across the active fleet.
+
+    Resolves "active" the same way the daily blacklist scan does
+    (status in [active, verified] + not scheduled for destruction). Fires
+    one check per shard (or per unique NS pair, for nameserver_reputation).
+    Returns the count fired + estimated credit cost so the CRM can warn
+    before the user commits.
+    """
+    check_type: str  # 'domain_reputation' | 'nameserver_reputation'
+    confirm: bool = False  # must be true to actually fire; else returns estimate only
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -274,6 +307,45 @@ def placement_test(req: PlacementTestRequest, bg: BackgroundTasks, _: str = Depe
         req.sender_email, req.campaign_id,
     )
     return {"job_id": job_id, "domain": req.domain, "status": "pending"}
+
+
+@app.post("/api/spamhaus-check")
+def spamhaus_ad_hoc(req: SpamhausAdHocRequest, _: str = Depends(verify_api_key)):
+    """Fire any of the 5 Spamhaus Intelligence checks ad-hoc.
+
+    Synchronous from the caller's perspective: we POST to EmailGuard, persist
+    the queued row, then poll up to ~60s for completion. The CRM drawer can
+    then read the result row directly from Supabase.
+    """
+    allowed = {"domain_reputation", "nameserver_reputation", "a_record_reputation",
+               "domain_senders", "domain_context"}
+    if req.check_type not in allowed:
+        raise HTTPException(400, f"check_type must be one of: {sorted(allowed)}")
+    try:
+        from lib.spamhaus_ad_hoc import run_ad_hoc_check
+        result = run_ad_hoc_check(req.check_type, req.domain, req.shard_domain, req.client_slug)
+        return result
+    except Exception as exc:
+        raise HTTPException(502, f"Spamhaus check failed: {exc}")
+
+
+@app.post("/api/spamhaus-fleet-scan")
+def spamhaus_fleet_scan(req: SpamhausFleetScanRequest, _: str = Depends(verify_api_key)):
+    """Bulk-trigger domain_reputation or nameserver_reputation across the active fleet.
+
+    Two-phase: a GET-like call with confirm=false returns the cost estimate;
+    a follow-up with confirm=true actually fires the checks. The CRM uses
+    this to display a confirmation dialog with the credit count.
+    """
+    if req.check_type not in {"domain_reputation", "nameserver_reputation"}:
+        raise HTTPException(400, "check_type must be domain_reputation or nameserver_reputation")
+    try:
+        from lib.spamhaus_ad_hoc import estimate_fleet_scan, run_fleet_scan
+        if not req.confirm:
+            return estimate_fleet_scan(req.check_type)
+        return run_fleet_scan(req.check_type)
+    except Exception as exc:
+        raise HTTPException(502, f"Spamhaus fleet scan failed: {exc}")
 
 
 @app.get("/api/emailguard/quota")

@@ -29,7 +29,6 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib import blocklist
 from lib.bison import export as bison_export
 from lib.client_context import (
     ClientContext,
@@ -275,9 +274,6 @@ def run_deploy(
             inst = vps_client.wait_for_instance_ready(instance_id)
             ip = inst.get("ip")
             ip6 = inst.get("ip6")
-            # Per-client blocklist webhook — skips silently if the client
-            # hasn't configured one (no leaks to other clients' monitoring).
-            blocklist.notify_check_ip(ip, ctx.blocklist_webhook_url)
             ssh_credentials = vps_client.ensure_ssh_user(instance_id, ssh_key_id)
 
             state.set("vps", {
