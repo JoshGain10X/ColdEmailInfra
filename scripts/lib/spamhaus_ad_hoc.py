@@ -215,11 +215,18 @@ def estimate_fleet_scan(check_type: str) -> dict:
 
 
 def run_fleet_scan(check_type: str) -> dict:
-    """Fire the bulk scan. Returns the count actually initiated.
+    """Fire the bulk scan, then poll for completion.
 
-    Does NOT wait for completion — each individual check polls itself via
-    the daily cron's polling phase (if we add it later) or via the CRM's
-    auto-refresh. Pollers can pick up queued rows by check_uuid.
+    Two-phase to avoid stranding rows as 'queued' in spamhaus_checks (which the
+    CRM dialog filters out via latest_spamhaus_per_shard.status='completed'):
+      1. POST each check in parallel, persist queued rows with their UUIDs
+      2. Poll every 5s for up to 45s, downloading + persisting completed rows
+
+    EmailGuard's Spamhaus endpoints typically complete within 1-3s when the
+    domain is well-known, slightly longer for fresh ones. 45s comfortably
+    covers ~10 checks (the typical NS fleet) plus headroom. Domain-reputation
+    fleet scans across the full fleet (~50 checks) would exceed this — for
+    those, we'd want background polling, but they're not a current use case.
     """
     sb = _sb()
     shards = _active_shards()
@@ -228,17 +235,51 @@ def run_fleet_scan(check_type: str) -> dict:
     else:
         targets_with_slug = [(s["domain"], (s.get("clients") or {}).get("slug")) for s in shards]
 
-    fired = 0
+    # Phase 1: kick off every check, capture UUIDs
+    pending: list[tuple[str, str]] = []  # (uuid, target)
     for target, slug in targets_with_slug:
         try:
-            run_ad_hoc_check(check_type, target, target, slug, max_poll_seconds=0)
-            fired += 1
-            time.sleep(0.2)  # gentle pace to avoid concurrency limits
+            res = run_ad_hoc_check(check_type, target, target, slug, max_poll_seconds=0)
+            uuid = res.get("check_uuid")
+            if uuid:
+                pending.append((uuid, target))
+            time.sleep(0.2)
         except Exception:
             continue
 
+    # Phase 2: poll until everything is completed or budget exhausted
+    _, _, get_base = CHECK_PATHS[check_type]
+    start = time.time()
+    completed = 0
+    while pending and (time.time() - start) < 45:
+        time.sleep(5)
+        still_pending: list[tuple[str, str]] = []
+        for uuid, target in pending:
+            try:
+                gr = requests.get(f"{EMAILGUARD_BASE}{get_base}/{uuid}", headers=_headers(), timeout=15)
+                if gr.status_code == 404:
+                    still_pending.append((uuid, target))
+                    continue
+                gr.raise_for_status()
+                data = (gr.json() or {}).get("data") or {}
+                if data.get("status") == "completed":
+                    sb.table("spamhaus_checks").update({
+                        "status": "completed",
+                        "result": data,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        **_extract_summary(check_type, data),
+                    }).eq("check_uuid", uuid).execute()
+                    completed += 1
+                else:
+                    still_pending.append((uuid, target))
+            except Exception:
+                still_pending.append((uuid, target))
+        pending = still_pending
+
     return {
         "check_type": check_type,
-        "fired": fired,
-        "credit_cost": fired * CHECK_COSTS[check_type],
+        "fired": len(targets_with_slug),
+        "completed": completed,
+        "still_queued": len(pending),
+        "credit_cost": len(targets_with_slug) * CHECK_COSTS[check_type],
     }
