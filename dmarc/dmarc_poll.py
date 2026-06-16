@@ -95,27 +95,41 @@ def _upsert_aggregate(sb: Client, report: dict, shard_domain: str, client_slug: 
     if existing.data:
         return False
 
+    # parsedmarc's aggregate-report shape (per its source `parsed_aggregate_reports_to_csv_rows`):
+    #   record["count"]                   -> int message count
+    #   record["alignment"]["dkim"]       -> bool
+    #   record["alignment"]["spf"]        -> bool
+    #   record["alignment"]["dmarc"]      -> bool (we use dkim+spf for our composite)
+    #   record["source"]["ip_address"]    -> str (was record["source"]["ip_address"] not row.source_ip)
+    #   record["source"]["reverse_dns"]   -> str
+    #   record["policy_evaluated"]["disposition"] -> str
+    #   record["identifiers"]["header_from"]      -> str
+    #   record["identifiers"]["envelope_from"]    -> str
+    #   record["identifiers"]["envelope_to"]      -> str
+    #   record["auth_results"]["dkim"]            -> list of {selector,domain,result}
+    #   record["auth_results"]["spf"]             -> list of {domain,scope,result}
     rows_to_insert = []
     for rec in report.get("records", []) or []:
-        ident = rec.get("identifiers") or {}
-        result = rec.get("auth_results") or {}
-        rec_row = rec.get("row") or {}
-        policy_eval = rec_row.get("policy_evaluated") or {}
-        dkim_results = result.get("dkim") or []
-        spf_results = result.get("spf") or []
+        source = rec.get("source") or {}
+        alignment = rec.get("alignment") or {}
+        identifiers = rec.get("identifiers") or {}
+        policy_eval = rec.get("policy_evaluated") or {}
+        auth = rec.get("auth_results") or {}
+        dkim_results = auth.get("dkim") or []
+        spf_results = auth.get("spf") or []
         rows_to_insert.append({
             "report_id": report_id,
-            "source_ip": rec_row.get("source_ip") or rec.get("source", {}).get("ip_address"),
-            "source_ptr": rec.get("source", {}).get("reverse_dns"),
-            "count": _int(rec_row.get("count")) or 0,
+            "source_ip": source.get("ip_address"),
+            "source_ptr": source.get("reverse_dns"),
+            "count": _int(rec.get("count")) or 0,
             "disposition": policy_eval.get("disposition"),
-            "dkim_aligned": policy_eval.get("dkim") == "pass",
-            "spf_aligned": policy_eval.get("spf") == "pass",
+            "dkim_aligned": bool(alignment.get("dkim")),
+            "spf_aligned": bool(alignment.get("spf")),
             "dkim_result": (dkim_results[0].get("result") if dkim_results else None),
             "spf_result": (spf_results[0].get("result") if spf_results else None),
-            "header_from": ident.get("header_from"),
-            "envelope_from": ident.get("envelope_from"),
-            "envelope_to": ident.get("envelope_to"),
+            "header_from": identifiers.get("header_from"),
+            "envelope_from": identifiers.get("envelope_from"),
+            "envelope_to": identifiers.get("envelope_to"),
             "dkim_domains": [d.get("domain") for d in dkim_results if d.get("domain")],
             "spf_domain": (spf_results[0].get("domain") if spf_results else None),
         })
