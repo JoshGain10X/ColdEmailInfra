@@ -148,10 +148,22 @@ def _active_shards() -> list[dict]:
 
 
 def _resolve_nameservers(domain: str) -> tuple[str, ...]:
-    """Return the sorted tuple of NS hostnames for a domain. Empty on failure."""
+    """Return the sorted tuple of NS hostnames for a domain.
+
+    Uses dnspython with explicit upstream resolvers (1.1.1.1 + 8.8.8.8) because
+    the container's default /etc/resolv.conf often points at a resolver that
+    refuses NS queries for arbitrary external zones — silent empty answers,
+    which collapsed the whole fleet down to the 2 pairs we got out of the first
+    attempt. Short 3s timeout per resolver so a sweep across ~50 shards stays
+    well inside the FastAPI 60s budget.
+    """
     try:
-        import dns.resolver  # provided via requirements.txt (dnspython>=2.6)
-        answers = dns.resolver.resolve(domain, "NS", lifetime=5.0)
+        import dns.resolver
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
+        resolver.lifetime = 3.0
+        resolver.timeout = 3.0
+        answers = resolver.resolve(domain, "NS")
         return tuple(sorted(str(r.target).rstrip(".").lower() for r in answers))
     except Exception:
         return ()
@@ -161,20 +173,20 @@ def _distinct_nameserver_reps(sb: Client, shards: list[dict]) -> list[str]:
     """Return one representative domain per distinct NS pair across the fleet.
 
     We don't store nameservers in infra_domains — resolve them live via DNS at
-    scan time. Cloudflare clusters many domains onto the same NS pair (e.g.
-    `elisa.ns.cloudflare.com` + `vicente.ns.cloudflare.com`), so this collapses
-    ~50 shards into 6-12 representative checks.
-
-    Sequential resolution with a 5s timeout per domain is fine for 50 shards
-    (~30s worst-case). If we grow past ~200 shards consider threading.
+    scan time. Cloudflare assigns 2 of ~700 NS hosts per zone, so 50 zones in
+    the 10X account cluster onto roughly 8-15 distinct pairs. Parallel resolution
+    keeps the sweep under 5s even at fleet size.
     """
     from collections import defaultdict
+    from concurrent.futures import ThreadPoolExecutor
+
+    domains = [s["domain"] for s in shards]
     by_pair: dict[tuple[str, ...], list[str]] = defaultdict(list)
-    for shard in shards:
-        ns = _resolve_nameservers(shard["domain"])
-        if ns:
-            by_pair[ns].append(shard["domain"])
-    return [domains[0] for domains in by_pair.values()]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for domain, ns in zip(domains, pool.map(_resolve_nameservers, domains)):
+            if ns:
+                by_pair[ns].append(domain)
+    return [pair_domains[0] for pair_domains in by_pair.values()]
 
 
 def estimate_fleet_scan(check_type: str) -> dict:
