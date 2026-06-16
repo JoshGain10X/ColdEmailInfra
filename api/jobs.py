@@ -1518,11 +1518,11 @@ def _resolve_spintax(text: str) -> str:
         text = text[: m.start()] + choice + text[m.end():]
 
 
-def _resolve_workspace_for_shard(client_id: str, domain: str) -> dict | None:
+def _resolve_workspace_for_shard(client_id: str, domain: str):
     """Find the Bison workspace where this shard's mailboxes are loaded.
     Falls back to the client's default workspace if the shard hasn't been
-    loaded yet. Returns the workspace dict with api_key + base_url, or None
-    if no workable workspace exists."""
+    loaded yet. Returns a BisonWorkspace dataclass (with .name, .base_url,
+    ._api_key attributes) or None if no workable workspace exists."""
     sb = _supabase()
     shard = (
         sb.table("infra_shards")
@@ -1540,7 +1540,7 @@ def _resolve_workspace_for_shard(client_id: str, domain: str) -> dict | None:
         return None
     if bison_workspace_name:
         for ws in (ctx.workspaces or []):
-            if ws.get("workspace_name") == bison_workspace_name:
+            if ws.name == bison_workspace_name:
                 return ws
     return ctx.default_workspace
 
@@ -1556,10 +1556,10 @@ def _fetch_bison_campaign_body(
     or None on any failure — placement-test then falls back to the default
     body."""
     ws = _resolve_workspace_for_shard(client_id, domain)
-    if not ws or not ws.get("api_key") or not ws.get("base_url"):
+    if not ws or not ws._api_key or not ws.base_url:
         return None
-    headers = {"Authorization": f"Bearer {ws['api_key']}"}
-    base = ws["base_url"].rstrip("/")
+    headers = {"Authorization": f"Bearer {ws._api_key}"}
+    base = ws.base_url.rstrip("/")
 
     # Resolve the campaign id if the caller didn't pin one
     if campaign_id is None:
