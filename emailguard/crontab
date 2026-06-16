@@ -1,0 +1,6 @@
+# EmailGuard placement-test poller. Runs every 5 min. Each tick:
+#   1) lists all inbox-placement tests via the EmailGuard HTTP API
+#   2) parses the name field for our AUTO|<shard>|<sender>|<ts> prefix
+#   3) upserts the test header into dmarc... err public.emailguard_placement_tests
+#   4) upserts each per-seed row into public.emailguard_placement_emails
+*/5 * * * * /usr/local/bin/python /app/emailguard/poll.py

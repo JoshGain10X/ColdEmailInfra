@@ -24,7 +24,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from auth import verify_api_key
-from jobs import run_deploy, run_destroy, run_verify, run_load_to_bison, run_domain_sync, run_domain_register, run_install_sieve
+from jobs import (
+    run_deploy, run_destroy, run_verify, run_load_to_bison,
+    run_domain_sync, run_domain_register, run_install_sieve,
+    run_placement_test, fetch_emailguard_quota,
+)
 from lib.client_context import load_client_context_by_slug, load_client_context_for_shard
 
 load_dotenv()  # Do NOT override process env — docker --env-file values win
@@ -149,6 +153,14 @@ class AddBisonWorkspaceRequest(BaseModel):
     purpose: Optional[str] = None  # 'cold_outbound' | 'warming' | etc
 
 
+class PlacementTestRequest(BaseModel):
+    client_slug: Optional[str] = None  # inferred from domain if absent
+    domain: str
+    sender_email: Optional[str] = None  # random pick from shard mailboxes if absent
+    campaign_id: Optional[int] = None   # Bison campaign step-1 body source; if absent, use built-in default
+    created_by: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -239,6 +251,41 @@ def load_to_bison(domain: str, bg: BackgroundTasks, req: Optional[LoadToBisonReq
     job_id = _create_job("load_bison", client_id, domain, total_steps=6, created_by=created_by)
     bg.add_task(run_load_to_bison, job_id, client_id, domain, workspace, tag)
     return {"job_id": job_id, "domain": domain, "status": "pending"}
+
+
+@app.post("/api/placement-test")
+def placement_test(req: PlacementTestRequest, bg: BackgroundTasks, _: str = Depends(verify_api_key)):
+    """Fire an EmailGuard inbox-placement test for the given shard.
+
+    Server-side: checks quota, creates a test on EmailGuard (encoding the
+    shard + sender + timestamp in the test name so the sidecar can match it
+    back), then SSHes the shard's mail VPS to drip-send a campaign body to
+    the seed list returned by EmailGuard. The frontend polls Supabase
+    `emailguard_placement_tests` (populated by the ingest sidecar) for the
+    result; this endpoint returns the test_uuid immediately.
+    """
+    if req.client_slug:
+        client_id = _resolve_client_id(req.client_slug)
+    else:
+        client_id = _resolve_client_id_from_domain(req.domain)
+    job_id = _create_job("placement_test", client_id, req.domain, total_steps=4, created_by=req.created_by)
+    bg.add_task(
+        run_placement_test, job_id, client_id, req.domain,
+        req.sender_email, req.campaign_id,
+    )
+    return {"job_id": job_id, "domain": req.domain, "status": "pending"}
+
+
+@app.get("/api/emailguard/quota")
+def emailguard_quota(_: str = Depends(verify_api_key)):
+    """Return remaining EmailGuard placement-test quota for the current month.
+
+    Server-side proxy so the CRM never sees the EmailGuard API key.
+    """
+    try:
+        return fetch_emailguard_quota()
+    except Exception as exc:
+        raise HTTPException(502, f"EmailGuard quota fetch failed: {exc}")
 
 
 @app.get("/api/shards")

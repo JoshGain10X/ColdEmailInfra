@@ -1438,3 +1438,244 @@ def run_domain_register(job_id: str, client_id: str, domain: str) -> None:
     except Exception as exc:
         _append_log(sb, job_id, f"FAILED: {exc}")
         _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# EmailGuard placement test — triggered from the CRM "Test placement" button.
+# Creates an EmailGuard inbox-placement test, then SSHes the shard's mail VPS
+# and submits a 1:1 drip of the campaign body to the 8 seed addresses returned
+# by EmailGuard. The coldemail-emailguard-ingest sidecar picks up the test
+# state asynchronously (every 5 min) so the CRM sees per-seed placement as
+# it lands.
+# ---------------------------------------------------------------------------
+
+import random as _random
+import re as _re
+import time as _time
+import urllib.parse as _urlparse
+import requests as _requests
+
+
+_EMAILGUARD_BASE = os.environ.get("EMAILGUARD_BASE", "https://app.emailguard.io")
+
+
+def fetch_emailguard_quota() -> dict:
+    """Server-side proxy for /api/account so the CRM never sees the API key.
+    Returns just the workspace quota fields the CRM needs."""
+    key = os.environ.get("EMAILGUARD_API_KEY")
+    if not key:
+        raise RuntimeError("EMAILGUARD_API_KEY not configured")
+    r = _requests.get(
+        f"{_EMAILGUARD_BASE}/api/v1/workspaces/current",
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    ws = r.json().get("data") or {}
+    return {
+        "remaining_inbox_placement_tests": ws.get("remaining_inbox_placement_tests"),
+        "total_inbox_placement_tests": ws.get("total_inbox_placement_tests"),
+        "remaining_email_verification_credits": ws.get("remaining_monthly_email_verification_credits"),
+    }
+
+
+# Default placement-test body when caller doesn't supply a campaign_id.
+# Same campaign-37-derived copy we've been using for seed tests this week.
+_DEFAULT_PLACEMENT_SUBJECT = "an idea for your company"
+_DEFAULT_PLACEMENT_BODY = """<p>Hi there,</p>
+<p><br></p>
+<p>We're inviting a select group of UK companies into something this month, and one company wins a complete management programme, built around their people and delivered on us. I wanted to put your company forward.</p>
+<p><br></p>
+<p>Quick picture of what's actually on the table. This isn't training, and we don't do slides. Each session is a bespoke, interactive webpage shaped by you and your managers and built around the challenges your company is actually facing. Nothing we do is off the shelf.</p>
+<p><br></p>
+<p>Once the sessions end, our online platform and AI coach, Tensai, carry it on, embedding the learning so it sticks and drives real behaviour change. Everything that works is captured into a living playbook, an organisational management handbook built by your managers, for your managers.</p>
+<p><br></p>
+<p>Just say the word and I'll explain how to get your company in the running.</p>
+<p><br></p>
+<p>Best,</p>
+<p>{SENDER_FIRST_NAME}</p>
+<p><br></p>
+<p><strong>{SENDER_FIRST_NAME} {SENDER_LAST_NAME}</strong> | Learning &amp; Development Partner</p>
+<p>10X Managers Limited</p>
+<p>FYI if you'd rather I didn't reach out, just say the word.</p>
+<p><br></p>
+<p>Prefer not to hear from us? Reply 'no thanks' and I'll stop there.</p>
+<p><br></p>
+<span style="color:#ffffff;font-size:1px">{PHRASE}</span>
+"""
+
+
+# Resolve Bison spintax `{a|b|c}` by picking the first option.
+# Variable substitutions (FIRST_NAME / COMPANY / SENDER_*) are resolved by
+# the caller before invoking this. Pure text transform, no I/O.
+def _resolve_spintax(text: str) -> str:
+    pattern = _re.compile(r"\{([^{}]*\|[^{}]*)\}")
+    while True:
+        m = pattern.search(text)
+        if not m:
+            return text
+        choice = m.group(1).split("|")[0]
+        text = text[: m.start()] + choice + text[m.end():]
+
+
+def _fetch_bison_campaign_body(client_id: str, campaign_id: int) -> tuple[str, str] | None:
+    """Pull step 1 subject + body from a Bison campaign. Returns None if the
+    client doesn't have a default workspace token or the campaign isn't
+    found. Best-effort — placement-test fires with the default body if this
+    returns None."""
+    try:
+        ctx = load_client_context_by_id(client_id)
+    except Exception:
+        return None
+    ws = ctx.default_workspace
+    if not ws or not ws.get("api_key") or not ws.get("base_url"):
+        return None
+    headers = {"Authorization": f"Bearer {ws['api_key']}"}
+    base = ws["base_url"].rstrip("/")
+    try:
+        r = _requests.get(f"{base}/api/campaigns/{campaign_id}/sequence-steps", headers=headers, timeout=15)
+        r.raise_for_status()
+        steps = (r.json() or {}).get("data") or []
+        if not steps:
+            return None
+        s = steps[0]
+        subject = s.get("email_subject") or _DEFAULT_PLACEMENT_SUBJECT
+        body = s.get("email_body") or _DEFAULT_PLACEMENT_BODY
+        return subject, body
+    except Exception:
+        return None
+
+
+def run_placement_test(
+    job_id: str,
+    client_id: str,
+    domain: str,
+    sender_email: str | None,
+    campaign_id: int | None,
+) -> None:
+    """Background task: create EmailGuard test, then drip-send campaign body
+    from the chosen mailbox on the shard's mail VPS."""
+    sb = _supabase()
+    eg_key = os.environ.get("EMAILGUARD_API_KEY")
+    if not eg_key:
+        _append_log(sb, job_id, "FAILED: EMAILGUARD_API_KEY not set on infra-api")
+        _complete_job(sb, job_id, error="EMAILGUARD_API_KEY missing")
+        return
+
+    try:
+        # 1. Verify quota
+        quota = _requests.get(
+            f"{_EMAILGUARD_BASE}/api/v1/workspaces/current",
+            headers={"Authorization": f"Bearer {eg_key}"},
+            timeout=15,
+        )
+        quota.raise_for_status()
+        remaining = (quota.json().get("data") or {}).get("remaining_inbox_placement_tests")
+        if remaining is None or remaining <= 0:
+            _append_log(sb, job_id, f"FAILED: quota exhausted (remaining={remaining})")
+            _complete_job(sb, job_id, error="quota_exhausted")
+            return
+        _append_log(sb, job_id, f"Quota OK: {remaining} placement tests remaining", step=1)
+
+        # 2. Resolve shard state + sender
+        state = ShardState(domain)
+        if not state.path.exists():
+            raise RuntimeError(f"no shard state file for {domain}")
+        vps_ip = (state.get("vps") or {}).get("ip")
+        if not vps_ip:
+            raise RuntimeError("shard has no vps_ip")
+        mailboxes = state.get("mailboxes") or []
+        dmarc_inbox = state.get("dmarc_inbox")
+        candidates = [m for m in mailboxes if m.get("email") and m.get("email") != dmarc_inbox]
+        if sender_email:
+            mb = next((m for m in candidates if m.get("email") == sender_email), None)
+            if not mb:
+                raise RuntimeError(f"sender {sender_email} not in shard mailbox list")
+        else:
+            if not candidates:
+                raise RuntimeError("no eligible sender mailbox on shard")
+            mb = _random.choice(candidates)
+        sender = mb["email"]
+        first = mb.get("first_name") or sender.split("@", 1)[0].split(".")[0].title()
+        last = mb.get("last_name") or ""
+        _append_log(sb, job_id, f"Sender: {sender} ({first} {last})", step=2)
+
+        # 3. Create EmailGuard test with AUTO-named prefix the sidecar can parse
+        ts = int(_time.time())
+        name = f"AUTO|{domain}|{sender}|{ts}"
+        eg_create = _requests.post(
+            f"{_EMAILGUARD_BASE}/api/v1/inbox-placement-tests",
+            headers={"Authorization": f"Bearer {eg_key}", "Content-Type": "application/json"},
+            json={"name": name},
+            timeout=30,
+        )
+        if eg_create.status_code >= 400:
+            raise RuntimeError(f"EmailGuard create failed {eg_create.status_code}: {eg_create.text[:300]}")
+        eg_data = (eg_create.json() or {}).get("data") or {}
+        test_uuid = eg_data["uuid"]
+        phrase = eg_data["filter_phrase"]
+        seeds_csv = eg_data["comma_separated_test_email_addresses"]
+        seeds = [s.strip() for s in seeds_csv.split(",") if s.strip()]
+        _append_log(sb, job_id, f"EmailGuard test {test_uuid} created with {len(seeds)} seeds", step=3)
+
+        # 4. Resolve campaign body if requested, else default
+        subject, body_template = _DEFAULT_PLACEMENT_SUBJECT, _DEFAULT_PLACEMENT_BODY
+        if campaign_id is not None:
+            fetched = _fetch_bison_campaign_body(client_id, campaign_id)
+            if fetched:
+                subject, body_template = fetched
+                _append_log(sb, job_id, f"Using campaign {campaign_id} step-1 body")
+            else:
+                _append_log(sb, job_id, f"campaign {campaign_id} fetch failed; using default body")
+
+        # Resolve spintax + variables. Generic ICP-neutral substitutions.
+        subject = _resolve_spintax(subject).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first)
+        body = _resolve_spintax(body_template).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first).replace("{SENDER_LAST_NAME}", last).replace("{SENDER_EMAIL_SIGNATURE}", "").replace("{PHRASE}", phrase)
+
+        # 5. SSH the shard's mail VPS, upload a tiny smtplib drip script, exec
+        ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
+        ssh_user = (state.get("vps") or {}).get("ssh_user") or os.environ.get("SSH_USER", "admin")
+        ms = MailserverClient(vps_ip, ssh_key, user=ssh_user)
+        ms.connect()
+        try:
+            send_script = f'''#!/usr/bin/env python3
+import smtplib, ssl, time, json
+from email.message import EmailMessage
+ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+SENDER={sender!r}; SENDER_NAME={(first + ' ' + last).strip()!r}; PASSWORD={SHARED_MAILBOX_PASSWORD!r}
+SEEDS={seeds!r}
+SUBJECT={subject!r}
+HTML_BODY={body!r}
+ok=err=0
+for rcpt in SEEDS:
+    msg=EmailMessage()
+    msg["From"]=f"{{SENDER_NAME}} <{{SENDER}}>"; msg["To"]=rcpt; msg["Subject"]=SUBJECT
+    msg.set_content("Plain-text fallback.")
+    msg.add_alternative(HTML_BODY, subtype="html")
+    try:
+        with smtplib.SMTP("localhost",587,timeout=30) as s:
+            s.ehlo(); s.starttls(context=ctx); s.ehlo()
+            s.login(SENDER, PASSWORD)
+            s.send_message(msg, from_addr=SENDER, to_addrs=[rcpt])
+        ok+=1
+    except Exception as e:
+        err+=1
+    time.sleep(4)
+print(json.dumps({{"ok": ok, "err": err}}))
+'''
+            ms.upload_text(send_script, "/tmp/eg_send.py")
+            rc, out, _se = ms.run("python3 /tmp/eg_send.py", check=False)
+            _append_log(sb, job_id, f"Drip-send result: rc={rc} out={out.strip()[:200]}", step=4)
+        finally:
+            ms.close()
+
+        # 6. Persist the test_uuid so the frontend can poll
+        sb.table("infra_jobs").update({
+            "result": {"test_uuid": test_uuid, "sender": sender, "seeds": len(seeds), "phrase": phrase},
+        }).eq("id", job_id).execute()
+
+        _complete_job(sb, job_id)
+
+    except Exception as exc:
+        _append_log(sb, job_id, f"FAILED: {type(exc).__name__}: {exc}")
+        _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")
