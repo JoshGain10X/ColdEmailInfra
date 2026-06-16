@@ -124,6 +124,11 @@ CHECK_COSTS = {
 
 
 def _active_shards() -> list[dict]:
+    """Active = status in (active,verified) AND bison_loaded AND no in-flight retirement.
+
+    Retirement table is `bison_domain_retirements` (NOT bison_root_retirements
+    which doesn't exist — the table name was wrong in an earlier draft).
+    """
     sb = _sb()
     rows = (
         sb.table("infra_shards")
@@ -133,7 +138,7 @@ def _active_shards() -> list[dict]:
         .execute().data or []
     )
     retirements = (
-        sb.table("bison_root_retirements")
+        sb.table("bison_domain_retirements")
         .select("root_domain,status")
         .not_.in_("status", ["cancelled", "reversed", "torn_down"])
         .execute().data or []
@@ -142,23 +147,33 @@ def _active_shards() -> list[dict]:
     return [r for r in rows if r["domain"].lower() not in blocked]
 
 
+def _resolve_nameservers(domain: str) -> tuple[str, ...]:
+    """Return the sorted tuple of NS hostnames for a domain. Empty on failure."""
+    try:
+        import dns.resolver  # provided via requirements.txt (dnspython>=2.6)
+        answers = dns.resolver.resolve(domain, "NS", lifetime=5.0)
+        return tuple(sorted(str(r.target).rstrip(".").lower() for r in answers))
+    except Exception:
+        return ()
+
+
 def _distinct_nameserver_reps(sb: Client, shards: list[dict]) -> list[str]:
     """Return one representative domain per distinct NS pair across the fleet.
 
-    Cloudflare clusters many domains onto the same NS pair, so this collapses
+    We don't store nameservers in infra_domains — resolve them live via DNS at
+    scan time. Cloudflare clusters many domains onto the same NS pair (e.g.
+    `elisa.ns.cloudflare.com` + `vicente.ns.cloudflare.com`), so this collapses
     ~50 shards into 6-12 representative checks.
+
+    Sequential resolution with a 5s timeout per domain is fine for 50 shards
+    (~30s worst-case). If we grow past ~200 shards consider threading.
     """
     from collections import defaultdict
-    by_pair = defaultdict(list)
-    domain_names = [s["domain"] for s in shards]
-    domain_rows = (
-        sb.table("infra_domains").select("domain,nameservers")
-        .in_("domain", domain_names).execute().data or []
-    )
-    for row in domain_rows:
-        ns = tuple(sorted((row.get("nameservers") or [])))
+    by_pair: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for shard in shards:
+        ns = _resolve_nameservers(shard["domain"])
         if ns:
-            by_pair[ns].append(row["domain"])
+            by_pair[ns].append(shard["domain"])
     return [domains[0] for domains in by_pair.values()]
 
 
