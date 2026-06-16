@@ -1518,20 +1518,74 @@ def _resolve_spintax(text: str) -> str:
         text = text[: m.start()] + choice + text[m.end():]
 
 
-def _fetch_bison_campaign_body(client_id: str, campaign_id: int) -> tuple[str, str] | None:
-    """Pull step 1 subject + body from a Bison campaign. Returns None if the
-    client doesn't have a default workspace token or the campaign isn't
-    found. Best-effort — placement-test fires with the default body if this
-    returns None."""
+def _resolve_workspace_for_shard(client_id: str, domain: str) -> dict | None:
+    """Find the Bison workspace where this shard's mailboxes are loaded.
+    Falls back to the client's default workspace if the shard hasn't been
+    loaded yet. Returns the workspace dict with api_key + base_url, or None
+    if no workable workspace exists."""
+    sb = _supabase()
+    shard = (
+        sb.table("infra_shards")
+        .select("bison_workspace")
+        .eq("client_id", client_id)
+        .eq("domain", domain)
+        .limit(1)
+        .execute()
+        .data
+    )
+    bison_workspace_name = (shard or [{}])[0].get("bison_workspace")
     try:
         ctx = load_client_context_by_id(client_id)
     except Exception:
         return None
-    ws = ctx.default_workspace
+    if bison_workspace_name:
+        for ws in (ctx.workspaces or []):
+            if ws.get("workspace_name") == bison_workspace_name:
+                return ws
+    return ctx.default_workspace
+
+
+def _fetch_bison_campaign_body(
+    client_id: str,
+    domain: str,
+    campaign_id: int | None,
+) -> tuple[str, str, int | None] | None:
+    """Pull step 1 subject + body from a Bison campaign. If campaign_id is None,
+    picks the most-active campaign (highest emails_sent) in the shard's
+    workspace that's in a sending state. Returns (subject, body, campaign_id)
+    or None on any failure — placement-test then falls back to the default
+    body."""
+    ws = _resolve_workspace_for_shard(client_id, domain)
     if not ws or not ws.get("api_key") or not ws.get("base_url"):
         return None
     headers = {"Authorization": f"Bearer {ws['api_key']}"}
     base = ws["base_url"].rstrip("/")
+
+    # Resolve the campaign id if the caller didn't pin one
+    if campaign_id is None:
+        try:
+            r = _requests.get(f"{base}/api/campaigns?per_page=50", headers=headers, timeout=15)
+            r.raise_for_status()
+            campaigns = (r.json() or {}).get("data") or []
+            # Bison campaign statuses that mean "currently in the sending pool".
+            # `active` is the steady-state; `queued`/`launching` are about-to-send;
+            # `paused` is reversible. We exclude `completed` and `draft` because
+            # the copy may no longer reflect what's actually going out.
+            active = [
+                c for c in campaigns
+                if (c.get("status") or "").lower() in ("active", "queued", "launching", "paused")
+            ]
+            # Highest send volume wins — closest proxy to "real copy being read by ISPs"
+            active.sort(key=lambda c: int(c.get("emails_sent") or 0), reverse=True)
+            chosen = next((c for c in active if int(c.get("emails_sent") or 0) > 0), None)
+            if not chosen and active:
+                chosen = active[0]
+            if not chosen:
+                return None
+            campaign_id = int(chosen["id"])
+        except Exception:
+            return None
+
     try:
         r = _requests.get(f"{base}/api/campaigns/{campaign_id}/sequence-steps", headers=headers, timeout=15)
         r.raise_for_status()
@@ -1541,7 +1595,7 @@ def _fetch_bison_campaign_body(client_id: str, campaign_id: int) -> tuple[str, s
         s = steps[0]
         subject = s.get("email_subject") or _DEFAULT_PLACEMENT_SUBJECT
         body = s.get("email_body") or _DEFAULT_PLACEMENT_BODY
-        return subject, body
+        return subject, body, campaign_id
     except Exception:
         return None
 
@@ -1618,15 +1672,18 @@ def run_placement_test(
         seeds = [s.strip() for s in seeds_csv.split(",") if s.strip()]
         _append_log(sb, job_id, f"EmailGuard test {test_uuid} created with {len(seeds)} seeds", step=3)
 
-        # 4. Resolve campaign body if requested, else default
+        # 4. Resolve campaign body. Always try a real active campaign first
+        # (so the placement test reflects what we're actually sending);
+        # fall back to the default body only if nothing's available.
         subject, body_template = _DEFAULT_PLACEMENT_SUBJECT, _DEFAULT_PLACEMENT_BODY
-        if campaign_id is not None:
-            fetched = _fetch_bison_campaign_body(client_id, campaign_id)
-            if fetched:
-                subject, body_template = fetched
-                _append_log(sb, job_id, f"Using campaign {campaign_id} step-1 body")
-            else:
-                _append_log(sb, job_id, f"campaign {campaign_id} fetch failed; using default body")
+        used_campaign_id: int | None = None
+        fetched = _fetch_bison_campaign_body(client_id, domain, campaign_id)
+        if fetched:
+            subject, body_template, used_campaign_id = fetched
+            tag = "specified" if campaign_id is not None else "auto-picked"
+            _append_log(sb, job_id, f"Using campaign {used_campaign_id} step-1 body ({tag})")
+        else:
+            _append_log(sb, job_id, "No active campaign body available; using default placement-test body")
 
         # Resolve spintax + variables. Generic ICP-neutral substitutions.
         subject = _resolve_spintax(subject).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first)
@@ -1669,9 +1726,15 @@ print(json.dumps({{"ok": ok, "err": err}}))
         finally:
             ms.close()
 
-        # 6. Persist the test_uuid so the frontend can poll
+        # 6. Persist the test_uuid + which campaign body was used
         sb.table("infra_jobs").update({
-            "result": {"test_uuid": test_uuid, "sender": sender, "seeds": len(seeds), "phrase": phrase},
+            "result": {
+                "test_uuid": test_uuid,
+                "sender": sender,
+                "seeds": len(seeds),
+                "phrase": phrase,
+                "campaign_id": used_campaign_id,
+            },
         }).eq("id", job_id).execute()
 
         _complete_job(sb, job_id)
