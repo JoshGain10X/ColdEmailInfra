@@ -23,14 +23,78 @@ Two integrations to unlock. Phase A = Google's signal. Phase B = Microsoft's sig
 
 ### Step 3 — Configure the OAuth consent screen (one-off)
 
-1. Sidebar → **APIs & Services** → **OAuth consent screen**.
-2. User Type: **External**. Click **CREATE**.
-3. Fill in just the required fields:
-   - App name: `reachos-postmaster`
-   - User support email: `josh.gain@reachos.co`
-   - Developer contact: `josh.gain@reachos.co`
-4. Click **SAVE AND CONTINUE** through the next 3 screens (Scopes, Test users, Summary) — nothing to fill on those, just click through.
-5. On the dashboard, find **Test users** → Add: `josh.gain@reachos.co`. Save.
+This is the screen the browser will show you when the bootstrap script asks you to consent. We're filling out who the "app" is (just us) so Google knows what to display.
+
+**Heads up before starting**: GCP renamed this section recently. The sidebar entry might say "OAuth consent screen", "Audience", or "Branding" depending on the rollout state of your account. They all lead to the same wizard. If you're not sure which to click, the URL is: https://console.cloud.google.com/auth/branding (substitute your project ID if needed).
+
+**Make sure the project name at the top of the page is `reachos-postmaster` for every step below.**
+
+**Sub-step 3a — Open the wizard**
+
+1. Sidebar (left side) → click **APIs & Services**
+2. Within that submenu, click **OAuth consent screen** (might be labelled "Branding" in newer UIs — same thing)
+3. If you see a "Get started" intro page, click **GET STARTED**.
+
+**Sub-step 3b — App information**
+
+You'll see a form. Fill EXACTLY these fields, skip everything else:
+
+- **App name**: `reachos-postmaster`
+- **User support email**: select `josh.gain@reachos.co` from the dropdown
+- **App logo**: skip (leave empty)
+- **Application home page**: skip
+- **Application privacy policy link**: skip
+- **Application terms of service link**: skip
+
+Click **NEXT** at the bottom.
+
+**Sub-step 3c — Audience**
+
+Choose **External**. (Internal only works inside a Google Workspace org and we don't need that complication.)
+
+Click **NEXT**.
+
+**Sub-step 3d — Contact information**
+
+- **Email addresses**: type `josh.gain@reachos.co` and press Enter
+
+Click **NEXT**.
+
+**Sub-step 3e — Finish**
+
+You'll see a summary. Tick the "I agree to the Google API Services User Data Policy" checkbox.
+
+Click **CONTINUE** then **CREATE**.
+
+**Sub-step 3f — Add yourself as a test user**
+
+The app is now in "Testing" mode, which means ONLY emails added to the test-user list can authenticate. We need to add `josh.gain@reachos.co`.
+
+1. Still in APIs & Services → look for **Audience** in the sidebar (or stay on the current page; depending on UI it might be a tab labelled **Audience** or **Test users**)
+2. Scroll to the section called **Test users**
+3. Click **+ ADD USERS**
+4. Type `josh.gain@reachos.co` → press Enter → click **SAVE**
+
+You should see one test user listed. If it's there, Step 3 is done.
+
+**Skipping the Scopes screen**
+
+If anywhere in the flow you land on a "Scopes" screen and don't know what to do, leave it empty and click **SAVE AND CONTINUE**. Our bootstrap script declares the scope it needs (`postmaster.readonly`) at runtime; we don't need to pre-declare it here. Google may complain that no scopes are selected — ignore the warning, click through.
+
+**What "Testing" status means + the scary warning you'll see later**
+
+The app stays in Testing status forever — we don't need to publish it. When you run the bootstrap script in Step 5 and the browser opens the consent page, you'll see a big yellow warning:
+
+> Google hasn't verified this app
+> The app is requesting access to sensitive info in your Google Account. Until the developer (you) verifies this app with Google, you shouldn't use it.
+
+This is **expected and safe** — Google warns about all unverified Testing-mode apps. To proceed:
+1. Click **Advanced** (a small text link at the bottom of the warning panel)
+2. Click **Go to reachos-postmaster (unsafe)** (the "(unsafe)" is just Google being dramatic)
+3. The proper consent screen appears
+4. Click **Continue** / **Allow**
+
+That's it.
 
 ### Step 4 — Create the OAuth client credentials
 
