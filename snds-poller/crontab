@@ -1,0 +1,4 @@
+# Daily Microsoft SNDS CSV pull.
+# Microsoft refreshes data with ~24h lag - we pull at 07:15 UTC (15 min after
+# the GPT poller so the two don't race for the Supabase write window).
+15 7 * * * /usr/local/bin/python /app/snds-poller/poll.py

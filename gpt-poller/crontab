@@ -1,0 +1,4 @@
+# Daily Google Postmaster Tools pull.
+# Google publishes day-N stats around 24-36h after the day ends, so we pull
+# 07:00 UTC and ask for yesterday's data. Verified to be available by then.
+0 7 * * * /usr/local/bin/python /app/gpt-poller/poll.py
