@@ -1,4 +1,9 @@
-# Daily Google Postmaster Tools pull.
-# Google publishes day-N stats around 24-36h after the day ends, so we pull
-# 07:00 UTC and ask for yesterday's data. Verified to be available by then.
-0 7 * * * /usr/local/bin/python /app/gpt-poller/poll.py
+# Hourly Google Postmaster Tools sweep.
+# Two roles in one script:
+#   1. trafficStats pull (idempotent upsert on (domain, date) - no harm running
+#      hourly even though Google publishes once per day)
+#   2. CRM lifecycle handoff: shards in pending_verify status need their
+#      gpt_status flipped to 'verified' as soon as Google's domains.list
+#      reports them - operator can register a domain and see it transition
+#      in <= 60 min instead of waiting until tomorrow's 07:00 cron.
+0 * * * * /usr/local/bin/python /app/gpt-poller/poll.py

@@ -161,6 +161,21 @@ class PlacementTestRequest(BaseModel):
     created_by: Optional[str] = None
 
 
+class GptRegisterRequest(BaseModel):
+    """CRM-managed Google Postmaster Tools registration handoff.
+
+    Operator manually adds the domain in postmaster.google.com UI (Google
+    doesn't expose an API for that step), copies the verification token
+    Google shows, and submits it here. We:
+      1. Look up the shard's Cloudflare zone
+      2. Write/update the apex `google-site-verification=<token>` TXT record
+      3. Flip the shard's gpt_status to pending_verify
+    A background poller transitions to 'verified' when Google confirms.
+    """
+    token: str   # the long alphanumeric value Google shows in the UI
+    client_slug: Optional[str] = None
+
+
 class SpamhausAdHocRequest(BaseModel):
     """Trigger any of the 5 Spamhaus Intelligence checks ad-hoc.
 
@@ -307,6 +322,65 @@ def placement_test(req: PlacementTestRequest, bg: BackgroundTasks, _: str = Depe
         req.sender_email, req.campaign_id,
     )
     return {"job_id": job_id, "domain": req.domain, "status": "pending"}
+
+
+@app.post("/api/shards/{domain}/register-gpt")
+def register_gpt(domain: str, req: GptRegisterRequest, _: str = Depends(verify_api_key)):
+    """CRM-side handoff for Google Postmaster Tools registration.
+
+    Operator pastes the token Google's GPT UI showed them; we write the
+    verification TXT to Cloudflare so the operator can click VERIFY in the GPT
+    UI without touching DNS by hand. Shard status transitions:
+
+        pending_register --(this endpoint)--> pending_verify
+
+    A background poller (gpt-poller sidecar) flips pending_verify -> verified
+    once Google's domains.list endpoint reports the domain as verified.
+    """
+    sb = _sb()
+    # Resolve client + zone via the existing shard row
+    shard = sb.table("infra_shards").select(
+        "domain,client_id,gpt_status"
+    ).eq("domain", domain).limit(1).execute().data
+    if not shard:
+        raise HTTPException(404, f"shard {domain} not found")
+    if shard[0].get("gpt_status") == "verified":
+        raise HTTPException(409, f"{domain} is already gpt_verified")
+
+    try:
+        ctx = load_client_context_for_shard(domain)
+        zone_id = ctx.cloudflare.get_zone_id(domain)
+        if not zone_id:
+            raise HTTPException(404, f"no Cloudflare zone for {domain}")
+        # Write the verification TXT at the apex without clobbering existing
+        # SPF/DMARC/other TXT records.
+        ctx.cloudflare.add_or_update_verification_txt(
+            zone_id=zone_id,
+            name=domain,
+            prefix="google-site-verification",
+            token=req.token,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        sb.table("infra_shards").update({
+            "gpt_status": "failed",
+            "gpt_last_error": str(exc)[:500],
+        }).eq("domain", domain).execute()
+        raise HTTPException(502, f"Cloudflare TXT write failed: {exc}")
+
+    sb.table("infra_shards").update({
+        "gpt_status": "pending_verify",
+        "gpt_token": req.token,
+        "gpt_registered_at": datetime.now(timezone.utc).isoformat(),
+        "gpt_last_error": None,
+    }).eq("domain", domain).execute()
+
+    return {
+        "domain": domain,
+        "status": "pending_verify",
+        "next_step": "Click VERIFY on this domain in postmaster.google.com. Google checks the TXT every ~5 min and the poller will flip the status to 'verified' automatically.",
+    }
 
 
 @app.post("/api/spamhaus-check")

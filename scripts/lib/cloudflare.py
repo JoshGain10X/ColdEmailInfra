@@ -255,6 +255,36 @@ class CloudflareClient:
             page += 1
         return results
 
+    def add_or_update_verification_txt(
+        self, zone_id: str, name: str, prefix: str, token: str, **extra
+    ) -> dict:
+        """Add a Google-style verification TXT record without clobbering other TXTs.
+
+        Cloudflare allows multiple TXT records at the same name (SPF / DMARC /
+        google-site-verification / etc. routinely coexist). The default
+        upsert_record replaces the FIRST matching same-type record - dangerous
+        when we just want to add a new verification.
+
+        This helper:
+          1. Lists TXT records at `name`
+          2. Looks for an existing record whose value starts with `prefix=` (e.g.
+             "google-site-verification=") so we can safely update OUR record
+             without touching anyone else's TXT
+          3. Updates if found; otherwise POSTs a new one alongside existing TXTs
+        """
+        full_value = f"{prefix}={token}"
+        existing_txts = [r for r in self.list_records(zone_id, name=name) if r["type"] == "TXT"]
+        ours = next(
+            (r for r in existing_txts if (r.get("content") or "").lstrip('"').startswith(f"{prefix}=")),
+            None,
+        )
+        payload = {"type": "TXT", "name": name, "content": full_value, "ttl": 1, **extra}
+        if ours:
+            body = self._request("PUT", f"/zones/{zone_id}/dns_records/{ours['id']}", json=payload)
+            return body["result"]
+        body = self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
+        return body["result"]
+
     def upsert_record(self, zone_id: str, type: str, name: str, content: str, **extra) -> dict:
         """Create or update a DNS record. Matches existing records by (type, name).
 

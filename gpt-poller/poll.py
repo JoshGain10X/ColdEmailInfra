@@ -150,6 +150,43 @@ def main() -> int:
 
     domains = _list_domains(token)
     _log(f"  postmaster has {len(domains)} domain(s) registered")
+
+    # CRM-flow handoff: shards marked pending_verify should transition to
+    # verified as soon as Google reports them as verified. Do this BEFORE the
+    # trafficStats walk so the CRM badge updates promptly (the trafficStats
+    # for a freshly-verified domain may not be ready for another 24-48h).
+    sb_url = _env("SUPABASE_URL", "SUPABASE_COLD_EMAIL_URL")
+    sb_key = _env("SUPABASE_SERVICE_KEY", "SUPABASE_COLD_EMAIL_SERVICE_KEY")
+    if sb_url and sb_key:
+        verified_names = {
+            _domain_from_resource(d.get("name", ""))
+            for d in domains
+            if d.get("verificationStatus") == "VERIFIED"
+        }
+        if verified_names:
+            # Fetch pending_verify shards whose domain is now VERIFIED at Google
+            r = requests.get(
+                f"{sb_url.rstrip('/')}/rest/v1/infra_shards?select=domain&gpt_status=eq.pending_verify",
+                headers={"apikey": sb_key, "Authorization": f"Bearer {sb_key}"},
+                timeout=30,
+            )
+            if r.ok:
+                pending = {row["domain"] for row in (r.json() or [])}
+                newly_verified = pending & verified_names
+                if newly_verified:
+                    requests.patch(
+                        f"{sb_url.rstrip('/')}/rest/v1/infra_shards?domain=in.({','.join(newly_verified)})",
+                        headers={
+                            "apikey": sb_key,
+                            "Authorization": f"Bearer {sb_key}",
+                            "Content-Type": "application/json",
+                            "Prefer": "return=minimal",
+                        },
+                        json={"gpt_status": "verified", "gpt_verified_at": datetime.now(timezone.utc).isoformat()},
+                        timeout=30,
+                    )
+                    _log(f"  transitioned {len(newly_verified)} shard(s) pending_verify -> verified: {sorted(newly_verified)}")
+
     if not domains:
         _log("  nothing to poll - register domains via postmaster.google.com first")
         return 0
