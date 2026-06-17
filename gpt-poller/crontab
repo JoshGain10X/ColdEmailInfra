@@ -1,9 +1,11 @@
-# Hourly Google Postmaster Tools sweep.
+# Every-5-min Google Postmaster Tools sweep.
 # Two roles in one script:
-#   1. trafficStats pull (idempotent upsert on (domain, date) - no harm running
-#      hourly even though Google publishes once per day)
+#   1. trafficStats pull (idempotent upsert on (domain, date) - cheap)
 #   2. CRM lifecycle handoff: shards in pending_verify status need their
 #      gpt_status flipped to 'verified' as soon as Google's domains.list
-#      reports them - operator can register a domain and see it transition
-#      in <= 60 min instead of waiting until tomorrow's 07:00 cron.
-0 * * * * /usr/local/bin/python /app/gpt-poller/poll.py
+#      reports them. 5-min cadence keeps the operator's "verify in GPT UI ->
+#      see Verified in CRM" loop tight without burning quota.
+#
+# /api/shards/{domain}/gpt-refresh also triggers this script ad-hoc so
+# impatient operators don't have to wait for the next 5-min tick.
+*/5 * * * * /usr/local/bin/python /app/gpt-poller/poll.py
