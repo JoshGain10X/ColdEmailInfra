@@ -158,10 +158,14 @@ def main() -> int:
     sb_url = _env("SUPABASE_URL", "SUPABASE_COLD_EMAIL_URL")
     sb_key = _env("SUPABASE_SERVICE_KEY", "SUPABASE_COLD_EMAIL_SERVICE_KEY")
     if sb_url and sb_key:
+        # Google's /v1/domains endpoint doesn't expose verificationStatus.
+        # The actual fields are name, createTime, permission (NONE/READER/OWNER).
+        # A domain only appears in this list once ownership verification has
+        # succeeded - if `permission` is OWNER or READER, treat as verified.
         verified_names = {
             _domain_from_resource(d.get("name", ""))
             for d in domains
-            if d.get("verificationStatus") == "VERIFIED"
+            if d.get("permission") in ("OWNER", "READER")
         }
         if verified_names:
             # Pick up ANY shard (pending_register OR pending_verify) where Google
@@ -207,9 +211,12 @@ def main() -> int:
         name = _domain_from_resource(d.get("name", ""))
         if not name:
             continue
-        # Only pull from VERIFIED domains - unverified ones return permission errors
-        if d.get("verificationStatus") != "VERIFIED":
-            _log(f"  skip {name} (verification: {d.get('verificationStatus')})")
+        # Only pull from domains where we have OWNER/READER permission - Google
+        # only grants that after ownership verification succeeds. NONE means
+        # the domain is in our list but verification hasn't completed.
+        perm = d.get("permission")
+        if perm not in ("OWNER", "READER"):
+            _log(f"  skip {name} (permission: {perm})")
             continue
         try:
             stats = _get_traffic_stats(token, d["name"], target_date)
