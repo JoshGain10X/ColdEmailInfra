@@ -504,7 +504,27 @@ def run_deploy(
             mailbox_count=len(state.get("mailboxes", [])),
             step_flags=step_flags,
             csv_storage_path=csv_storage_path,
+            # Mark this shard as needing Postmaster Tools registration. The CRM
+            # surfaces this as a yellow "Register" badge in the gmail column,
+            # prompting the operator to walk through the GPT UI flow.
+            gpt_status="pending_register",
         )
+
+        # Track the shard's IP /24 in snds_ranges so the CRM can surface a
+        # "register this range with Microsoft" prompt if Webdock allocated us
+        # an IP outside our previously-registered ranges. Idempotent insert.
+        vps_ip = state.get("vps", {}).get("ip") if state.get("vps") else None
+        if vps_ip:
+            try:
+                cidr = ".".join(vps_ip.split(".")[:3]) + ".0/24"
+                sb.from_("snds_ranges").upsert(
+                    {"cidr": cidr, "status": "pending_submission"},
+                    on_conflict="cidr",
+                    ignore_duplicates=True,
+                ).execute()
+            except Exception as snds_exc:
+                # Non-fatal - operator can still register manually via the CRM
+                _append_log(sb, job_id, f"snds_ranges seed warning: {snds_exc}")
 
         _append_log(sb, job_id, "Deploy complete", step=10)
         _complete_job(sb, job_id)
