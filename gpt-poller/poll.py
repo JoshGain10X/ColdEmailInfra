@@ -164,9 +164,14 @@ def main() -> int:
             if d.get("verificationStatus") == "VERIFIED"
         }
         if verified_names:
-            # Fetch pending_verify shards whose domain is now VERIFIED at Google
+            # Pick up ANY shard (pending_register OR pending_verify) where Google
+            # now reports the domain as VERIFIED. Operators sometimes complete
+            # verification via Google's own flow (e.g. domain was already
+            # Google-Workspace-verified) and skip our CRM token-paste step.
+            # The poller is the single source of truth - if Google says verified,
+            # we treat it as verified regardless of how it got there.
             r = requests.get(
-                f"{sb_url.rstrip('/')}/rest/v1/infra_shards?select=domain&gpt_status=eq.pending_verify",
+                f"{sb_url.rstrip('/')}/rest/v1/infra_shards?select=domain&gpt_status=in.(pending_register,pending_verify)",
                 headers={"apikey": sb_key, "Authorization": f"Bearer {sb_key}"},
                 timeout=30,
             )
