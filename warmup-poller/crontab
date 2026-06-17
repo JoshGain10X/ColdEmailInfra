@@ -1,0 +1,5 @@
+# Instantly warmup poller - pulls health_score + days_warming per mailbox.
+# Runs every 4 hours so the CRM wmh% column reflects fresh-ish data without
+# burning Instantly API quota. Health scores typically move on day boundaries
+# (Instantly aggregates by date) so sub-hourly polling buys nothing.
+0 */4 * * * /usr/local/bin/python /app/warmup-poller/process_warmup_poller.py
