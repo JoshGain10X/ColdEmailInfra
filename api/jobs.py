@@ -1252,6 +1252,24 @@ def run_load_to_bison(
             except Exception as tag_exc:
                 _append_log(sb, job_id, f"Tag attach warning: {tag_exc}")
 
+            # Warming hold: tag every new sender 'Warming' so the daily volume
+            # ramp skips it (holds daily_limit=1) until its 14-day Instantly
+            # warm-up completes. The ramp removes this tag once the mailbox's
+            # instantly_warmup_state.initial_warmup_ends_at has passed, after
+            # which it ramps 1 -> 2 -> ... -> 10. See bison-deliverability
+            # process_volume_ramp.py.
+            try:
+                warming_obj = bison.find_or_create_tag("Warming")
+                warming_id = warming_obj.get("id")
+                if warming_id:
+                    bison.attach_tag_to_senders(warming_id, created_ids)
+                    _append_log(
+                        sb, job_id,
+                        f"Tagged {len(created_ids)} senders Warming (2-week hold)",
+                    )
+            except Exception as warming_exc:
+                _append_log(sb, job_id, f"Warming tag attach warning: {warming_exc}")
+
         # Upload CSV to Supabase Storage, namespaced by client
         storage_path = f"{ctx.slug}/{domain}.csv"
         try:
