@@ -103,6 +103,47 @@ Defaults: SMTP 465/SSL, IMAP 993/SSL, Daily Limit 10.
 
 Deletes the VPS, removes all DNS records for that zone's subdomains, archives the state file. Does NOT un-register the domain at Cloudflare Registrar (that's a manual step — register/unregister decisions should be deliberate).
 
+## Landing pages on sending-domain roots
+
+Opt-in per client via `client_settings.landing_page_url` (see
+`migrations/2026-07-07_landing_page_url.sql`). Example value:
+`https://hello.10xmanagers.com/outreach`.
+
+When set:
+
+- The deploy pipeline creates the apex A record **unproxied** (grey cloud)
+  and skips the Cloudflare redirect rule. Caddy on the shard VPS terminates
+  TLS for `https://<root>` with its own Let's Encrypt cert, the same pattern
+  as the `mta-sts.<root>` vhost.
+- A `setup_landing` deploy step (right after MTA-STS install) appends a
+  marker-delimited vhost block to `/etc/caddy/Caddyfile` that reverse-proxies
+  the landing origin. A small allowlist of framework asset paths passes
+  through untouched; **every other path is rewritten to the landing path**,
+  so the client's full site is never browsable on a sending domain.
+- No `www` record, and no changes to sender subdomains, MX, TXT, MTA-STS or
+  DKIM.
+
+When NULL (ReachOS, Scouted, etc.) the legacy behaviour is unchanged:
+proxied apex plus a 301 redirect rule to `client_settings.redirect_url`.
+
+Retrofit existing live shards (bison_loaded=true) with:
+
+```bash
+python scripts/retrofit_landing_page.py --dry-run          # print intent
+python scripts/retrofit_landing_page.py --client 10x-managers
+python scripts/retrofit_landing_page.py --domain get10xleaders.com
+python scripts/retrofit_landing_page.py                    # whole eligible fleet
+```
+
+The retrofit flips the apex to grey-cloud, installs the Caddy vhost over
+SSH, tries to delete the old redirect rule (tolerated if the token lacks
+ruleset permission - the rule is unreachable once the apex is grey-cloud),
+verifies `https://<root>/` serves the landing page, and marks
+`landing_page_configured` in the shard state plus `step_flags.landing_page`
+in `infra_shards`. Re-runs are no-ops. On destroy, nothing extra is needed:
+the apex record goes with the zone wipe and the Caddy vhost dies with the
+VPS.
+
 ## Runbook notes
 
 - **Warmup**: first two weeks post-deploy, keep Bison's warmup at 2–5/inbox/day, then ramp to 10.

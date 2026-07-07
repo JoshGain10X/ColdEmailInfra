@@ -230,7 +230,9 @@ def deploy(req: DeployRequest, bg: BackgroundTasks, _: str = Depends(verify_api_
         image_id = req.image_id or os.environ.get("CONTABO_IMAGE_ID", "d64d5c6c-9dda-4e38-8174-0ee282474d8a")
     # For webdock, run_deploy fills missing values from ClientContext
 
-    job_id = _create_job("deploy", client_id, req.domain, total_steps=10, created_by=req.created_by)
+    # 11 steps: the setup_landing step (landing page vhost) was added after
+    # install_mta_sts, so the final "Deploy complete" marker is now step 11.
+    job_id = _create_job("deploy", client_id, req.domain, total_steps=11, created_by=req.created_by)
     bg.add_task(
         run_deploy, job_id, client_id, req.domain,
         provider, req.product_id, req.region, req.image_id, req.ssl_type,

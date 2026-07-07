@@ -63,6 +63,7 @@ class ClientContext:
     slug: str
     name: str
     redirect_url: Optional[str]
+    landing_page_url: Optional[str]
     vps_region: str
     vps_plan: str
     vps_image_slug: Optional[str]
@@ -263,6 +264,10 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
         slug=client_row["slug"],
         name=client_row["name"],
         redirect_url=settings.get("redirect_url"),
+        # Opt-in: when set, the sending-domain apex serves this landing page
+        # from the shard's own Caddy (grey-cloud A record, no redirect rule).
+        # NULL keeps the legacy proxied-apex + 301-redirect behaviour.
+        landing_page_url=settings.get("landing_page_url"),
         vps_region=settings.get("vps_region") or "dk",
         vps_plan=settings.get("vps_plan") or "webdocknano",
         vps_image_slug=settings.get("vps_image_slug"),

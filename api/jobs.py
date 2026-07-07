@@ -326,7 +326,14 @@ def run_deploy(
             spf_parts.extend(["mx", "-all"])
             spf_record = "v=spf1 " + " ".join(spf_parts)
 
-            cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=True)
+            # Apex A record. With a landing page configured the apex is
+            # grey-cloud (proxied=False) so Caddy on the VPS terminates TLS
+            # for https://<domain> with its own Let's Encrypt cert - same
+            # pattern as the unproxied mta-sts.<domain> record below. Without
+            # one, keep legacy behaviour: proxied apex + Cloudflare redirect
+            # rule to the client site.
+            cf.upsert_record(zone_id, "A", domain, vps_ip,
+                             proxied=(ctx.landing_page_url is None))
             cf.upsert_record(zone_id, "A", mail_host, vps_ip, proxied=False)
             if vps_ip6:
                 cf.upsert_record(zone_id, "AAAA", mail_host, vps_ip6, proxied=False)
@@ -365,10 +372,16 @@ def run_deploy(
                     zone_id, "TXT", f"_dmarc.{fqdn}",
                     f"v=DMARC1; p=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
                 )
-            try:
-                cf.ensure_redirect_rule(zone_id, domain, redirect_target)
-            except RuntimeError:
-                _append_log(sb, job_id, "Redirect rule warning: add manually in Cloudflare")
+            if ctx.landing_page_url:
+                # The apex serves the landing page from the shard's own Caddy
+                # (setup_landing step below) - no redirect rule wanted.
+                _append_log(sb, job_id,
+                    "Landing page configured: apex unproxied, redirect rule skipped")
+            else:
+                try:
+                    cf.ensure_redirect_rule(zone_id, domain, redirect_target)
+                except RuntimeError:
+                    _append_log(sb, job_id, "Redirect rule warning: add manually in Cloudflare")
             state.mark_step_done("configure_dns")
         _append_log(sb, job_id, "DNS configured", step=5)
 
@@ -449,6 +462,27 @@ def run_deploy(
             state.mark_step_done("install_mta_sts")
         _append_log(sb, job_id, "MTA-STS + TLS-RPT live")
 
+        # Step 6.6: Landing page vhost on the apex (opt-in per client).
+        # When client_settings.landing_page_url is set, configure_dns created
+        # the apex A record unproxied, so Caddy can terminate TLS for
+        # https://<domain> and reverse-proxy the landing origin. Every
+        # non-asset path is rewritten to the landing path so the client's
+        # full site is never browsable on a sending domain. Idempotent: the
+        # managed Caddyfile block is replaced, never duplicated. No-op for
+        # clients without a landing page (they keep the redirect rule).
+        if not state.is_step_done("setup_landing"):
+            if ctx.landing_page_url:
+                _append_log(sb, job_id,
+                    f"Configuring landing page vhost ({ctx.landing_page_url})")
+                ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
+                ms.connect()
+                try:
+                    ms.install_landing_page(domain, ctx.landing_page_url)
+                finally:
+                    ms.close()
+            state.mark_step_done("setup_landing")
+        _append_log(sb, job_id, "Landing page step complete", step=8)
+
         # Step 7: Setup DKIM
         if not state.is_step_done("setup_dkim"):
             _append_log(sb, job_id, "Generating DKIM keys")
@@ -467,7 +501,7 @@ def run_deploy(
             finally:
                 ms.close()
             state.mark_step_done("setup_dkim")
-        _append_log(sb, job_id, "DKIM configured", step=8)
+        _append_log(sb, job_id, "DKIM configured", step=9)
 
         # Step 8: Export Bison CSV
         if not state.is_step_done("export_bison"):
@@ -476,7 +510,7 @@ def run_deploy(
             bison_export(state.get("mailboxes"), _mail_hostname(domain), out_path)
             state.set("bison_csv", str(out_path))
             state.mark_step_done("export_bison")
-        _append_log(sb, job_id, "Bison CSV exported", step=9)
+        _append_log(sb, job_id, "Bison CSV exported", step=10)
 
         # Upload CSV to Supabase Storage, namespaced by client slug so two
         # clients can hold the same domain without colliding in the bucket.
@@ -526,7 +560,7 @@ def run_deploy(
                 # Non-fatal - operator can still register manually via the CRM
                 _append_log(sb, job_id, f"snds_ranges seed warning: {snds_exc}")
 
-        _append_log(sb, job_id, "Deploy complete", step=10)
+        _append_log(sb, job_id, "Deploy complete", step=11)
         _complete_job(sb, job_id)
 
     except Exception as exc:
@@ -598,6 +632,10 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
                     raise
 
         # Step 2: Delete DNS records (use the client's Cloudflare account)
+        # Landing-page teardown needs nothing extra here: the apex A record
+        # goes with delete_all_records below and the Caddy vhost dies with
+        # the VPS. delete_redirect_rules is a harmless no-op for landing-page
+        # clients (no redirect rule was created for them).
         _append_log(sb, job_id, "Deleting DNS records", step=2)
         cf = ctx.cloudflare
         zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)

@@ -5,6 +5,7 @@ import re
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import paramiko
 
@@ -15,6 +16,93 @@ DMS_TEMPLATE_DIR = REPO_ROOT / "docker-mailserver"
 # Where the mailserver compose project lives on the VPS. Must be writable
 # by the SSH user without sudo (so we avoid /opt).
 REMOTE_WORKDIR = "~/mailserver"
+
+# ---------------------------------------------------------------------------
+# Landing page vhost (apex of the sending domain)
+# ---------------------------------------------------------------------------
+
+# Marker comments delimiting the managed landing-page block inside
+# /etc/caddy/Caddyfile. install_landing_page replaces anything between them,
+# and install_mta_sts preserves the block when it regenerates the Caddyfile.
+LANDING_BLOCK_BEGIN = "# BEGIN landing-page vhost (managed by ColdEmailInfra)"
+LANDING_BLOCK_END = "# END landing-page vhost (managed by ColdEmailInfra)"
+
+# Origin paths passed through to the landing origin untouched (framework
+# assets referenced relatively by the landing page). Every OTHER path is
+# rewritten to the landing path before proxying, so the client's full site
+# is never browsable on a sending domain.
+LANDING_ASSET_PATHS = [
+    "/next-assets/*",
+    "/icon.svg",
+    "/apple-icon.png",
+    "/favicon.ico",
+    "/logo-chalk.svg",
+    "/robots.txt",
+]
+
+
+def landing_vhost_block(domain: str, landing_url: str) -> str:
+    """Caddy vhost serving a landing page on the sending domain's apex.
+
+    The apex A record must be unproxied (grey cloud) and point at this VPS
+    so Caddy can terminate TLS with its own Let's Encrypt cert - same
+    pattern as the mta-sts.<domain> vhost.
+
+    landing_url is the absolute https URL of the landing page on the
+    origin, e.g. https://hello.10xmanagers.com/outreach. Asset paths are
+    proxied through as-is; everything else is rewritten to the landing
+    path first. header_up Host is set explicitly to the origin hostname
+    (the origin routes on Host, and Caddy's https:// upstream already
+    gives us matching SNI).
+    """
+    parsed = urlparse(landing_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(
+            f"landing_page_url must be an absolute https URL, got {landing_url!r}"
+        )
+    origin_host = parsed.hostname
+    landing_path = parsed.path or "/"
+    asset_paths = " ".join(LANDING_ASSET_PATHS)
+    return f"""{LANDING_BLOCK_BEGIN}
+{domain} {{
+    @assets path {asset_paths}
+    handle @assets {{
+        reverse_proxy https://{origin_host} {{
+            header_up Host {origin_host}
+        }}
+    }}
+    handle {{
+        rewrite * {landing_path}
+        reverse_proxy https://{origin_host} {{
+            header_up Host {origin_host}
+        }}
+    }}
+}}
+{LANDING_BLOCK_END}
+"""
+
+
+def _extract_landing_block(caddyfile: str) -> str | None:
+    """Return the marker-delimited landing block from a Caddyfile, or None."""
+    begin = caddyfile.find(LANDING_BLOCK_BEGIN)
+    if begin == -1:
+        return None
+    end = caddyfile.find(LANDING_BLOCK_END, begin)
+    if end == -1:
+        return None
+    return caddyfile[begin:end + len(LANDING_BLOCK_END)] + "\n"
+
+
+def _strip_landing_block(caddyfile: str) -> str:
+    """Return the Caddyfile with any managed landing block removed."""
+    begin = caddyfile.find(LANDING_BLOCK_BEGIN)
+    if begin == -1:
+        return caddyfile
+    end = caddyfile.find(LANDING_BLOCK_END, begin)
+    if end == -1:
+        # Truncated/corrupt block - drop everything from the begin marker on.
+        return caddyfile[:begin]
+    return caddyfile[:begin] + caddyfile[end + len(LANDING_BLOCK_END):]
 
 
 class MailserverClient:
@@ -412,6 +500,15 @@ MTASTS 200
     }}
 }}
 """
+        # Preserve any managed landing-page vhost from a previous
+        # install_landing_page run. Without this, re-running install_mta_sts
+        # (e.g. to promote mode testing -> enforce) would silently drop the
+        # apex landing page.
+        _, existing_caddyfile, _ = self.sudo("cat /etc/caddy/Caddyfile", check=False)
+        landing_block = _extract_landing_block(existing_caddyfile or "")
+        if landing_block:
+            caddyfile = caddyfile.rstrip("\n") + "\n\n" + landing_block
+
         # Upload Caddyfile to /etc/caddy/Caddyfile (requires root)
         self.upload_text(caddyfile, "/tmp/Caddyfile.new")
         self.sudo("mv /tmp/Caddyfile.new /etc/caddy/Caddyfile")
@@ -431,6 +528,49 @@ MTASTS 200
             _, logs, _ = self.sudo("journalctl -u caddy --no-pager -n 30", check=False)
             raise RuntimeError(
                 f"Caddy did not start. Status: {status.strip()}\nLast logs:\n{logs}"
+            )
+
+    def install_landing_page(self, domain: str, landing_url: str) -> None:
+        """Add (or refresh) the apex landing-page vhost in /etc/caddy/Caddyfile
+        and reload Caddy so https://<domain> serves the configured landing
+        origin. See landing_vhost_block for the block contents.
+
+        Idempotent: any previous managed landing block is stripped before
+        the new one is appended, so re-runs never duplicate vhosts.
+
+        Requires Caddy to already be installed and configured by
+        install_mta_sts. The deploy pipeline runs that step first; retrofit
+        callers should ensure MTA-STS is present before calling this. The
+        apex DNS A record must be unproxied and pointing at this VPS before
+        Caddy can complete Let's Encrypt issuance for the apex.
+        """
+        rc, existing, _ = self.sudo("cat /etc/caddy/Caddyfile", check=False)
+        if rc != 0 or not existing.strip():
+            raise RuntimeError(
+                f"/etc/caddy/Caddyfile missing on {self.ip} - Caddy/MTA-STS is "
+                "not installed on this shard. Run install_mta_sts first."
+            )
+
+        base = _strip_landing_block(existing)
+        caddyfile = base.rstrip("\n") + "\n\n" + landing_vhost_block(domain, landing_url)
+
+        self.upload_text(caddyfile, "/tmp/Caddyfile.new")
+        self.sudo("mv /tmp/Caddyfile.new /etc/caddy/Caddyfile")
+        self.sudo("chown root:root /etc/caddy/Caddyfile")
+        self.sudo("chmod 644 /etc/caddy/Caddyfile")
+
+        # reload applies the new vhost without dropping in-flight requests
+        # to the mta-sts vhost; fall back to restart if Caddy wasn't running.
+        rc, _, _ = self.sudo("systemctl reload caddy", check=False)
+        if rc != 0:
+            self.sudo("systemctl restart caddy")
+
+        time.sleep(3)
+        _, status, _ = self.sudo("systemctl is-active caddy", check=False)
+        if "active" not in status:
+            _, logs, _ = self.sudo("journalctl -u caddy --no-pager -n 30", check=False)
+            raise RuntimeError(
+                f"Caddy did not reload cleanly. Status: {status.strip()}\nLast logs:\n{logs}"
             )
 
     def _wait_for_container(self, name: str, timeout: int = 300) -> None:
