@@ -456,7 +456,11 @@ def run_deploy(
             ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
             ms.connect()
             try:
-                ms.install_mta_sts(domain, mode="testing")
+                # Pass the subdomain list so the policy enumerates the real
+                # per-subdomain MX hosts (mail.<sub>.<root>), not just the apex.
+                ms.install_mta_sts(
+                    domain, mode="testing", subdomains=state.get("subdomains") or []
+                )
             finally:
                 ms.close()
             state.mark_step_done("install_mta_sts")

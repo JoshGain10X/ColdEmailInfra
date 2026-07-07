@@ -18,6 +18,39 @@ DMS_TEMPLATE_DIR = REPO_ROOT / "docker-mailserver"
 REMOTE_WORKDIR = "~/mailserver"
 
 # ---------------------------------------------------------------------------
+# Postfix per-destination rate cap (deliverability safety net)
+# ---------------------------------------------------------------------------
+
+# docker-mailserver merges a postfix-main.cf override file (in the container's
+# config dir, mounted from <workdir>/docker-data/dms/config/postfix-main.cf)
+# into Postfix's main.cf at container start. We use it to cap outbound to any
+# single receiving domain at ~1 msg/sec / 5 concurrent connections. This is a
+# safety net so a Bison misconfiguration cannot burst-hammer one receiver; at
+# our ~150/day/shard volumes it is non-binding in normal operation.
+#
+# Kept as a dict so both the templated deploy path and apply_postfix_rate_cap
+# (the live retrofit) write identical values.
+POSTFIX_RATE_CAP_SETTINGS = {
+    "default_destination_rate_delay": "1s",
+    "smtp_destination_concurrency_limit": "5",
+}
+
+
+def postfix_main_cf_override() -> str:
+    """Return the postfix-main.cf override body applying the rate cap.
+
+    docker-mailserver appends the lines in this file to main.cf verbatim at
+    container start, so plain `key = value` lines are all that is required.
+    """
+    lines = [
+        "# Managed by ColdEmailInfra - per-destination rate cap (safety net).",
+        "# Caps outbound to any single receiving domain; non-binding at our volumes.",
+    ]
+    for key, value in POSTFIX_RATE_CAP_SETTINGS.items():
+        lines.append(f"{key} = {value}")
+    return "\n".join(lines) + "\n"
+
+# ---------------------------------------------------------------------------
 # Landing page vhost (apex of the sending domain)
 # ---------------------------------------------------------------------------
 
@@ -156,6 +189,50 @@ class MailserverClient:
     def restart_mailserver(self) -> None:
         """Restart the docker-mailserver container (used after DKIM keygen)."""
         self.sudo(f"sh -c 'cd {self._workdir()} && docker compose restart mailserver'")
+
+    def apply_postfix_rate_cap(self) -> None:
+        """Apply the per-destination rate cap to a live shard, idempotently.
+
+        Two-part so it both survives restarts and takes effect immediately:
+          (a) Write/refresh <workdir>/docker-data/dms/config/postfix-main.cf
+              so the settings persist across container restarts (DMS merges
+              this file into main.cf at every start).
+          (b) Apply live without a restart via `postconf -e` inside the
+              container, then `postfix reload` (graceful - never restart).
+
+        Re-running just rewrites the same file and re-applies the same
+        settings, so it is safe to call repeatedly.
+        """
+        wd = self._workdir()
+        override_path = f"{wd}/docker-data/dms/config/postfix-main.cf"
+        self.run(f"mkdir -p $(dirname {override_path})")
+        self.upload_text(postfix_main_cf_override(), override_path)
+
+        # Apply live inside the container. postconf -e edits main.cf in place;
+        # `postfix reload` re-reads it gracefully without dropping the queue.
+        postconf_args = " ".join(
+            f'"{key}={value}"' for key, value in POSTFIX_RATE_CAP_SETTINGS.items()
+        )
+        self.sudo(f"docker exec mailserver postconf -e {postconf_args}")
+        self.sudo("docker exec mailserver postfix reload")
+
+    def verify_postfix_rate_cap(self) -> dict[str, str]:
+        """Return the live values Postfix reports for the rate-cap settings.
+
+        Reads them back via `postconf <key>` inside the container so a caller
+        can confirm the cap actually took (postconf prints `key = value`).
+        """
+        result: dict[str, str] = {}
+        for key in POSTFIX_RATE_CAP_SETTINGS:
+            _, out, _ = self.sudo(
+                f"docker exec mailserver postconf {key}", check=False
+            )
+            # postconf prints "key = value"; keep the value side.
+            value = ""
+            if "=" in out:
+                value = out.split("=", 1)[1].strip()
+            result[key] = value
+        return result
 
     def install_warmup_sieve(self, restart: bool = True) -> None:
         """Install the global Sieve filter that routes Instantly warmup peer
@@ -416,6 +493,14 @@ class MailserverClient:
         dovecot_cf = (DMS_TEMPLATE_DIR / "dovecot.cf").read_text()
         self.upload_text(dovecot_cf, f"{workdir}/docker-data/dms/config/dovecot.cf")
 
+        # Postfix per-destination rate cap. docker-mailserver merges this
+        # override into main.cf at container start, so every future shard
+        # gets the cap without a retrofit. See POSTFIX_RATE_CAP_SETTINGS.
+        self.upload_text(
+            postfix_main_cf_override(),
+            f"{workdir}/docker-data/dms/config/postfix-main.cf",
+        )
+
         # Stop any existing (possibly crash-looping) container before reconfiguring.
         self.sudo(f"sh -c 'cd {workdir} && docker compose down'", check=False)
 
@@ -457,7 +542,46 @@ class MailserverClient:
         self.sudo("apt-get update")
         self.sudo("apt-get install -y caddy")
 
-    def install_mta_sts(self, domain: str, mode: str = "testing", max_age: int = 86400) -> None:
+    @staticmethod
+    def mta_sts_policy(
+        domain: str,
+        subdomains: list[str] | None = None,
+        mode: str = "testing",
+        max_age: int = 86400,
+    ) -> str:
+        """Build the MTA-STS policy body (RFC 8461).
+
+        Each sending subdomain's MX is `mail.<sub>.<root>`, so the policy must
+        enumerate one `mx:` line per subdomain mail host. MTA-STS wildcards
+        only match a single label, so `mail.<sub>.<root>` can NOT be covered
+        by `*.<root>` - we have to list every real MX host. We also include
+        `mail.<root>` (the HELO / myhostname host) for completeness.
+
+        subdomains is the plain subdomain-label list from ShardState (e.g.
+        ["hr", "team"]); pass None/[] to fall back to just the apex mail host.
+        """
+        mx_hosts = [f"mail.{sub}.{domain}" for sub in sorted(subdomains or [])]
+        # Always include the apex mail host; de-dupe in case a "mail" label
+        # would otherwise produce mail.mail.<root> alongside it.
+        apex_host = f"mail.{domain}"
+        if apex_host not in mx_hosts:
+            mx_hosts.append(apex_host)
+
+        policy_lines = [
+            "version: STSv1",
+            f"mode: {mode}",
+        ]
+        policy_lines.extend(f"mx: {host}" for host in mx_hosts)
+        policy_lines.append(f"max_age: {max_age}")
+        return "\n".join(policy_lines) + "\n"
+
+    def install_mta_sts(
+        self,
+        domain: str,
+        mode: str = "testing",
+        max_age: int = 86400,
+        subdomains: list[str] | None = None,
+    ) -> None:
         """Install Caddy on this VPS and configure it to serve the MTA-STS
         policy at https://mta-sts.<domain>/.well-known/mta-sts.txt.
 
@@ -465,24 +589,27 @@ class MailserverClient:
         MUST use TLS'. Modern mailbox providers (Gmail, Outlook, Yahoo)
         treat it as a sender-quality signal.
 
+        The policy enumerates one `mx:` line per sending subdomain's mail host
+        (`mail.<sub>.<root>`) plus the apex `mail.<root>`, because each
+        subdomain's MX points at its own mail host and MTA-STS wildcards only
+        match a single label. Pass the shard's subdomain-label list in
+        `subdomains`; if omitted the policy lists only the apex mail host.
+
         Caddy handles Let's Encrypt provisioning automatically. The
         mta-sts.<domain> A record must resolve to this VPS *before*
         this call runs — done in the configure_dns step earlier in deploy.
 
         Starts at mode=testing for safety (policy violations are reported
-        via TLS-RPT but not enforced by receivers). Promote to mode=enforce
-        after 2-4 weeks of clean operation by re-running with mode='enforce'
-        or editing /etc/caddy/Caddyfile directly + `sudo systemctl reload caddy`.
+        via TLS-RPT but not enforced by receivers). Promoting to enforce is
+        intentionally NOT done here - it depends on the cert-coverage audit in
+        scripts/retrofit_mta_sts.py confirming every MX host is covered by the
+        presented TLS cert.
         """
         self._ensure_caddy_installed()
 
-        policy_lines = [
-            "version: STSv1",
-            f"mode: {mode}",
-            f"mx: mail.{domain}",
-            f"max_age: {max_age}",
-        ]
-        policy_body = "\n".join(policy_lines) + "\n"
+        policy_body = self.mta_sts_policy(
+            domain, subdomains=subdomains, mode=mode, max_age=max_age
+        )
 
         # Caddy block: serve the policy file on the canonical path,
         # 404 everything else. Caddy auto-acquires + renews the LE cert
@@ -588,6 +715,71 @@ MTASTS 200
             raise RuntimeError(
                 f"Caddy did not reload cleanly. Status: {status.strip()}\nLast logs:\n{logs}"
             )
+
+    def smtp_cert_names(self) -> list[str]:
+        """Return the DNS names on the TLS cert Postfix presents on port 25.
+
+        Opens a STARTTLS session against the local mailserver and reads the
+        subject CN plus every subjectAltName DNS entry from the presented
+        cert. Used by the MTA-STS enforce-readiness audit: if the cert does
+        not cover a given `mail.<sub>.<root>` MX host, promoting the policy to
+        enforce would break inbound replies to that subdomain.
+        """
+        cmd = (
+            "docker exec mailserver sh -c "
+            "\"echo | openssl s_client -connect localhost:25 -starttls smtp "
+            "2>/dev/null | openssl x509 -noout -subject -ext subjectAltName\""
+        )
+        _, out, _ = self.sudo(cmd, check=False)
+        return self._parse_cert_names(out)
+
+    @staticmethod
+    def _parse_cert_names(openssl_out: str) -> list[str]:
+        """Extract CN + SAN DNS names from openssl x509 -subject/-ext output.
+
+        Handles both the modern `subject=CN = mail.example.com` form and the
+        older `subject= /CN=mail.example.com` form, plus the
+        `X509v3 Subject Alternative Name:` block listing `DNS:host` entries.
+        """
+        names: list[str] = []
+        for line in openssl_out.splitlines():
+            line = line.strip()
+            if line.lower().startswith("subject"):
+                # subject=CN = host   OR   subject= /CN=host
+                for token in re.split(r"[/,]", line):
+                    m = re.search(r"CN\s*=\s*([^,/\s]+)", token)
+                    if m:
+                        names.append(m.group(1).strip())
+            if "DNS:" in line:
+                for m in re.findall(r"DNS:([^,\s]+)", line):
+                    names.append(m.strip())
+        # De-dupe, preserve order.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for n in names:
+            if n and n not in seen:
+                seen.add(n)
+                unique.append(n)
+        return unique
+
+    @staticmethod
+    def cert_covers(host: str, cert_names: list[str]) -> bool:
+        """True if `host` is covered by any cert name (exact or wildcard).
+
+        A wildcard `*.<parent>` matches exactly one extra label, matching the
+        real TLS rules (and MTA-STS's own single-label wildcard semantics).
+        """
+        for name in cert_names:
+            if name == host:
+                return True
+            if name.startswith("*."):
+                parent = name[2:]
+                # Wildcard matches exactly one leading label.
+                if host.endswith("." + parent):
+                    leading = host[: -(len(parent) + 1)]
+                    if leading and "." not in leading:
+                        return True
+        return False
 
     def _wait_for_container(self, name: str, timeout: int = 300) -> None:
         start = time.time()

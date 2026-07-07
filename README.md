@@ -144,6 +144,97 @@ in `infra_shards`. Re-runs are no-ops. On destroy, nothing extra is needed:
 the apex record goes with the zone wipe and the Caddy vhost dies with the
 VPS.
 
+## Deliverability hardening retrofits
+
+Three deliverability changes ship together. New shards get all of them at
+deploy time; existing live shards (bison_loaded=true) are brought up to date
+with the two retrofit scripts below.
+
+### 1. Postfix per-destination rate cap (safety net)
+
+Every shard writes a `postfix-main.cf` override into the docker-mailserver
+config dir (`docker-data/dms/config/postfix-main.cf`), which DMS merges into
+Postfix's `main.cf` at container start:
+
+```
+default_destination_rate_delay = 1s
+smtp_destination_concurrency_limit = 5
+```
+
+This caps outbound to any single receiving domain at ~1 msg/sec / 5 concurrent
+connections - a safety net so a Bison misconfiguration cannot burst-hammer one
+receiver. At our ~150/day/shard volumes it is non-binding in normal operation.
+
+Retrofit live shards (writes the override for restart persistence AND applies
+live via `postconf -e` + `postfix reload`, never a restart):
+
+```bash
+python scripts/retrofit_postfix_rate_cap.py --dry-run          # print intent
+python scripts/retrofit_postfix_rate_cap.py --client 10x-managers
+python scripts/retrofit_postfix_rate_cap.py --domain get10xleaders.com
+python scripts/retrofit_postfix_rate_cap.py                    # whole live fleet
+```
+
+It verifies via `postconf default_destination_rate_delay` and marks
+`postfix_rate_cap_applied` in shard state. Re-runs are no-ops.
+
+### 2. MTA-STS policy MX fix + TLS-RPT retrofit
+
+Each sending subdomain's MX is `mail.<sub>.<root>`, so the MTA-STS policy must
+enumerate one `mx:` line per subdomain mail host plus the apex `mail.<root>`.
+MTA-STS wildcards only match a single label, so `mail.<sub>.<root>` cannot be
+covered by `*.<root>` - the hosts must be listed explicitly. The old policy
+listed only `mail.<root>`, which was incorrect. Example policy for a shard with
+subdomains `hr` and `team` (mode stays `testing`):
+
+```
+version: STSv1
+mode: testing
+mx: mail.hr.example.com
+mx: mail.team.example.com
+mx: mail.example.com
+max_age: 86400
+```
+
+The four oldest roots (become-a-10xmanager.com, developedwith10xmanagers.com,
+get10xmanagers.org, one10xmanagers.com) predate MTA-STS entirely and have no
+records or Caddy vhost; the retrofit bootstraps Caddy on those the same way as
+`retrofit_landing_page.py --bootstrap-caddy`.
+
+```bash
+python scripts/retrofit_mta_sts.py --dry-run                   # print intent + policy
+python scripts/retrofit_mta_sts.py --client 10x-managers
+python scripts/retrofit_mta_sts.py --domain become-a-10xmanager.com
+python scripts/retrofit_mta_sts.py                             # whole live fleet
+```
+
+It ensures the `mta-sts.<root>` A record, `_mta-sts.<root>` and
+`_smtp._tls.<root>` TXT records (policy id pinned in shard state so reruns do
+not churn it), installs the corrected vhost, and marks `mta_sts_retrofit_v2` in
+shard state. Re-runs are no-ops.
+
+### 3. Enforce-readiness cert audit (report only)
+
+`retrofit_mta_sts.py` also audits whether each shard could safely be promoted
+from `mode: testing` to `mode: enforce`. For each MX host `mail.<sub>.<root>`
+it inspects the TLS cert the mailserver presents on port 25:
+
+```
+docker exec mailserver sh -c "echo | openssl s_client -connect localhost:25 \
+  -starttls smtp 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName"
+```
+
+and checks whether the cert's CN + subjectAltName DNS entries cover every MX
+host (wildcards match a single label, matching TLS + MTA-STS semantics). It
+prints an ENFORCE-READINESS table per run: **ENFORCE-SAFE** (cert covers all MX
+hosts) or **ENFORCE-UNSAFE** (a name mismatch - promoting to enforce would
+break inbound replies to that subdomain).
+
+**Enforce is intentionally NOT auto-promoted.** The policy stays in `testing`
+mode everywhere until the cert audit confirms coverage and a human decides to
+flip it. The audit is the deliverable that tells us whether enforce is viable
+at all.
+
 ## Runbook notes
 
 - **Warmup**: first two weeks post-deploy, keep Bison's warmup at 2–5/inbox/day, then ramp to 10.
