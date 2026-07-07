@@ -87,7 +87,12 @@ def _verify_landing(domain: str) -> tuple[bool, str]:
     last = "no attempt made"
     while time.time() < deadline:
         try:
-            resp = requests.get(f"https://{domain}/", timeout=15)
+            # allow_redirects=False: while the apex DNS flip propagates, the
+            # old Cloudflare-proxied record can still answer with the legacy
+            # 301 to the client site - following it lands on a page that also
+            # contains the markers and false-positives the verify while the
+            # shard's own cert issuance is failing in the background.
+            resp = requests.get(f"https://{domain}/", timeout=15, allow_redirects=False)
             marker_hit = any(m in resp.text for m in VERIFY_MARKERS)
             if resp.status_code == 200 and marker_hit:
                 return True, f"200 OK, marker present ({len(resp.text)} bytes)"
