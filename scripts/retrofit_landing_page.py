@@ -127,6 +127,7 @@ def _retrofit_one(
     landing_url: str,
     ctx_cache: dict[str, ClientContext],
     dry_run: bool,
+    bootstrap_caddy: bool = False,
 ) -> dict:
     domain = shard_row["domain"]
     client_slug = shard_row["clients"]["slug"]
@@ -157,19 +158,22 @@ def _retrofit_one(
     cf = ctx.cloudflare
     zone_id = state.get("cloudflare_zone_id") or _zone_id(sb, cf, domain)
 
-    # (a) Apex A record -> grey cloud so Caddy terminates TLS itself
-    cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=False)
-    click.echo("  ✓ apex A record set to proxied=False")
-
-    # (b) Landing vhost via SSH + Caddy reload
+    # (a) Landing vhost via SSH + Caddy reload. Deliberately BEFORE the DNS
+    # flip: if this fails (e.g. pre-Caddy shard without --bootstrap-caddy),
+    # the apex keeps its current behaviour instead of pointing at a VPS
+    # with no web server. LE issuance simply retries once DNS lands.
     ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
     ms = MailserverClient(vps_ip, ssh_key, user=_ssh_user(state))
     ms.connect()
     try:
-        ms.install_landing_page(domain, landing_url)
+        ms.install_landing_page(domain, landing_url, bootstrap=bootstrap_caddy)
     finally:
         ms.close()
     click.echo("  ✓ Caddy vhost installed + reloaded")
+
+    # (b) Apex A record -> grey cloud so Caddy terminates TLS itself
+    cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=False)
+    click.echo("  ✓ apex A record set to proxied=False")
 
     # (c) Best-effort removal of the legacy apex redirect rule. The rule is
     # unreachable anyway once the apex is grey-cloud, so a 403 here is fine.
@@ -202,7 +206,10 @@ def _retrofit_one(
 @click.option("--domain", default=None, help="Scope to one shard root (skips the bison_loaded filter).")
 @click.option("--client", "client_slug", default=None, help="Scope to one client slug (e.g. 10x-managers).")
 @click.option("--dry-run", is_flag=True, help="Print intent only; touch nothing.")
-def main(domain: str | None, client_slug: str | None, dry_run: bool) -> None:
+@click.option("--bootstrap-caddy", is_flag=True,
+              help="Install Caddy on shards that predate MTA-STS (pre 2026-05-21) "
+                   "and start from a landing-only Caddyfile.")
+def main(domain: str | None, client_slug: str | None, dry_run: bool, bootstrap_caddy: bool) -> None:
     load_dotenv()
     sb = _supabase()
 
@@ -251,7 +258,8 @@ def main(domain: str | None, client_slug: str | None, dry_run: bool) -> None:
     for i, row in enumerate(eligible):
         try:
             results.append(
-                _retrofit_one(sb, row, landing_by_client[row["client_id"]], ctx_cache, dry_run)
+                _retrofit_one(sb, row, landing_by_client[row["client_id"]], ctx_cache, dry_run,
+                              bootstrap_caddy=bootstrap_caddy)
             )
         except Exception as exc:
             click.echo(f"  ✗ ERROR: {exc}")

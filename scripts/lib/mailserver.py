@@ -437,6 +437,26 @@ class MailserverClient:
         self._wait_for_container("mailserver")
         self.wait_for_mailserver_ready("mailserver")
 
+    def _ensure_caddy_installed(self) -> None:
+        """Install Caddy from the official cloudsmith repo. Each step is its
+        own sudo call — chaining via && would only elevate the first
+        command in the chain, and dpkg locks on a non-root caller.
+        All steps are individually idempotent so retry on partial failure
+        picks up cleanly.
+        """
+        self.sudo("apt-get update")
+        self.sudo("apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg")
+        self.sudo(
+            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
+            "| gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg\""
+        )
+        self.sudo(
+            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
+            "> /etc/apt/sources.list.d/caddy-stable.list\""
+        )
+        self.sudo("apt-get update")
+        self.sudo("apt-get install -y caddy")
+
     def install_mta_sts(self, domain: str, mode: str = "testing", max_age: int = 86400) -> None:
         """Install Caddy on this VPS and configure it to serve the MTA-STS
         policy at https://mta-sts.<domain>/.well-known/mta-sts.txt.
@@ -454,23 +474,7 @@ class MailserverClient:
         after 2-4 weeks of clean operation by re-running with mode='enforce'
         or editing /etc/caddy/Caddyfile directly + `sudo systemctl reload caddy`.
         """
-        # Install Caddy from the official cloudsmith repo. Each step is its
-        # own sudo call — chaining via && would only elevate the first
-        # command in the chain, and dpkg locks on a non-root caller.
-        # All steps are individually idempotent so retry on partial failure
-        # picks up cleanly.
-        self.sudo("apt-get update")
-        self.sudo("apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg")
-        self.sudo(
-            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' "
-            "| gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg\""
-        )
-        self.sudo(
-            "bash -c \"curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' "
-            "> /etc/apt/sources.list.d/caddy-stable.list\""
-        )
-        self.sudo("apt-get update")
-        self.sudo("apt-get install -y caddy")
+        self._ensure_caddy_installed()
 
         policy_lines = [
             "version: STSv1",
@@ -530,7 +534,7 @@ MTASTS 200
                 f"Caddy did not start. Status: {status.strip()}\nLast logs:\n{logs}"
             )
 
-    def install_landing_page(self, domain: str, landing_url: str) -> None:
+    def install_landing_page(self, domain: str, landing_url: str, bootstrap: bool = False) -> None:
         """Add (or refresh) the apex landing-page vhost in /etc/caddy/Caddyfile
         and reload Caddy so https://<domain> serves the configured landing
         origin. See landing_vhost_block for the block contents.
@@ -538,18 +542,30 @@ MTASTS 200
         Idempotent: any previous managed landing block is stripped before
         the new one is appended, so re-runs never duplicate vhosts.
 
-        Requires Caddy to already be installed and configured by
-        install_mta_sts. The deploy pipeline runs that step first; retrofit
-        callers should ensure MTA-STS is present before calling this. The
-        apex DNS A record must be unproxied and pointing at this VPS before
-        Caddy can complete Let's Encrypt issuance for the apex.
+        Normally requires Caddy to already be installed and configured by
+        install_mta_sts (the deploy pipeline runs that step first). Shards
+        deployed before 2026-05-21 predate Caddy/MTA-STS entirely; for those,
+        pass bootstrap=True to install Caddy and start from a minimal
+        Caddyfile containing only the landing vhost. The apex DNS A record
+        must be unproxied and pointing at this VPS before Caddy can complete
+        Let's Encrypt issuance for the apex (issuance retries in the
+        background, so vhost-then-DNS ordering is fine).
         """
         rc, existing, _ = self.sudo("cat /etc/caddy/Caddyfile", check=False)
         if rc != 0 or not existing.strip():
-            raise RuntimeError(
-                f"/etc/caddy/Caddyfile missing on {self.ip} - Caddy/MTA-STS is "
-                "not installed on this shard. Run install_mta_sts first."
+            if not bootstrap:
+                raise RuntimeError(
+                    f"/etc/caddy/Caddyfile missing on {self.ip} - Caddy/MTA-STS is "
+                    "not installed on this shard. Run install_mta_sts first, or "
+                    "re-run with bootstrap enabled (--bootstrap-caddy on the "
+                    "retrofit CLI)."
+                )
+            self._ensure_caddy_installed()
+            existing = (
+                "# Managed by ColdEmailInfra — do not edit by hand.\n"
+                f"{{\n    email ops@{domain}\n}}\n"
             )
+            self.sudo("systemctl enable caddy")
 
         base = _strip_landing_block(existing)
         caddyfile = base.rstrip("\n") + "\n\n" + landing_vhost_block(domain, landing_url)
