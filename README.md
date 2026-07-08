@@ -103,6 +103,67 @@ Defaults: SMTP 465/SSL, IMAP 993/SSL, Daily Limit 10.
 
 Deletes the VPS, removes all DNS records for that zone's subdomains, archives the state file. Does NOT un-register the domain at Cloudflare Registrar (that's a manual step — register/unregister decisions should be deliberate).
 
+### Teardown is atomic across all legs
+
+Teardown is a multi-leg process and the legs must all complete or the fleet
+drifts (orphan VPSes, zombie Instantly seats, stale flags). The authoritative
+path is `api/jobs.py:run_destroy` (the operator/API destroy); the legacy CLI
+above and `reconcile_fleet.py --fix` reuse the same shared helpers in
+`scripts/lib/teardown.py`. The legs, in order:
+
+1. Destroy the Webdock VPS, then **confirm** it is actually gone with a fresh
+   read. The shard is only marked `status=destroyed` when the VPS is confirmed
+   destroyed. On a warn/fail or an inconclusive read it is left in a distinct
+   `status=destroy_incomplete` state (so it never masquerades as a clean
+   teardown while a VPS keeps billing) and reconciliation flags it.
+2. Remove the Instantly warmup seats (disable warmup + delete account) and the
+   Bison senders for the shard, keyed off `instantly_warmup_state`. Both legs
+   are idempotent and best-effort; leftovers are caught by reconciliation.
+3. `bison_loaded` is **always** set to `false` as part of teardown, in every
+   path (its never being reset was the root cause of the stale-flag drift).
+4. Delete DNS records and redirect rules.
+
+**Force-complete for a DNS-only wedge:** if the VPS is already confirmed gone
+but the Cloudflare DNS delete 403s/401s (e.g. a token that has lost DNS-edit or
+Rulesets permission — the ReachOS case), teardown logs the CF failure and
+continues to a terminal state instead of wedging in `destruction_failed`
+forever. The stray records are inert without the VPS and can be cleaned later.
+No credentials are hardcoded anywhere in this path.
+
+## Fleet reconciliation
+
+`scripts/reconcile_fleet.py` is both the one-off cleanup tool for existing
+drift and the ongoing guard (run `--dry-run` on a schedule to detect
+regression). It cross-checks Supabase (`infra_shards`, `instantly_warmup_state`)
+against Webdock, Bison and Instantly and reconciles six drift classes:
+
+| class | what it detects | repair |
+|-------|-----------------|--------|
+| `orphan-vps` | Webdock server running for a dead shard | REQUIRES-APPROVAL (spend) |
+| `stale-bison-loaded` | `bison_loaded=true` on a dead shard | SAFE-FIX |
+| `zombie-instantly` | Instantly seats + Bison senders live for a dead shard | SAFE-FIX |
+| `unwarmed-senders` | live shard with no Instantly rows / all `enable_failed` | REQUIRES-APPROVAL |
+| `stuck-teardown` | shard wedged in `destroy_incomplete`/`destruction_failed` | REQUIRES-APPROVAL |
+| `root-domain` | `instantly_warmup_state.root_domain` truncated (`co.uk`) | SAFE-FIX |
+
+```bash
+python scripts/reconcile_fleet.py --dry-run                 # report everything (default-safe)
+python scripts/reconcile_fleet.py --dry-run --client reachos
+python scripts/reconcile_fleet.py --dry-run --only root-domain
+python scripts/reconcile_fleet.py --fix                     # apply SAFE fixes only
+python scripts/reconcile_fleet.py --fix --only stale-bison-loaded,zombie-instantly
+```
+
+`--dry-run` (or no flag) reports only and touches nothing. `--fix` applies the
+**SAFE-FIX** repairs, which are flag flips plus Instantly/Bison seat removal —
+all idempotent, no destructive VPS spend. **REQUIRES-APPROVAL** items (destroy
+an orphan VPS, retry Instantly enable, push unwarmed senders to warmup,
+force-complete a wedged teardown) are never auto-applied: they are printed in a
+"REQUIRES APPROVAL" section with the exact command to run, for a human to
+review. Needs `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `INSTANTLY_API_KEY` and
+`EB_SUPERADMIN_KEY` in the environment; run it inside the `coldemail-api-v2`
+container.
+
 ## Landing pages on sending-domain roots
 
 Opt-in per client via `client_settings.landing_page_url` (see

@@ -168,8 +168,10 @@ def process_shard(sb: Client, shard: str, superadmin_key: str, dry_run: bool = F
     failed = 0
     for i, r in enumerate(to_create, 1):
         domain = r["email"].split("@", 1)[1]
-        parts = domain.split(".")
-        root = ".".join(parts[-2:]) if len(parts) >= 2 else domain
+        # Registrable root ("eTLD+1"); keeps 3 labels for .co.uk etc. so joins
+        # on instantly_warmup_state.root_domain do not break.
+        from lib.teardown import registrable_root_domain
+        root = registrable_root_domain(domain)
         # Mirror api/jobs.py _row shape exactly. The NOT NULL instantly_account_id
         # constraint takes the email as a placeholder (Instantly's real account
         # UUID isn't queryable by us anyway - they index by email everywhere).

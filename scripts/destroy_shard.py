@@ -26,6 +26,33 @@ def _make_vps_client(provider: str):
     raise click.ClickException(f"Unknown provider in state: {provider!r}")
 
 
+def _offboard_from_state(state: ShardState, domain: str) -> None:
+    """Best-effort Instantly warmup-seat removal for the legacy CLI path.
+
+    This CLI does not talk to Supabase or hold a Bison workspace token, so it can
+    only remove Instantly seats (keyed by email, using INSTANTLY_API_KEY from the
+    environment). Bison sender removal for legacy shards is handled by
+    reconcile_fleet.py, which has the SuperAdmin key. Never fatal.
+    """
+    try:
+        from lib.teardown import remove_instantly_seats
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  Instantly off-board unavailable: {exc}")
+        return
+    mailboxes = state.get("mailboxes") or []
+    emails = [m.get("email") for m in mailboxes if isinstance(m, dict) and m.get("email")]
+    if not emails:
+        return
+    try:
+        res = remove_instantly_seats(emails)
+        click.echo(
+            f"  Instantly: deleted {res['deleted']}, already-gone {res['already_gone']} "
+            f"of {res['requested']}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  Instantly off-board warning: {exc}")
+
+
 @click.command()
 @click.option("--domain", required=True)
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt")
@@ -47,6 +74,11 @@ def main(domain: str, yes: bool) -> None:
             _make_vps_client(provider).destroy_instance(vps["id"])
         except Exception as exc:
             click.echo(f"  VPS destroy warning: {exc}")
+
+    # Off-board Instantly warmup seats + Bison senders recorded in state, so this
+    # legacy CLI path no longer leaves zombie seats / orphan senders behind. Uses
+    # the same shared helpers as run_destroy; best-effort and non-fatal.
+    _offboard_from_state(state, domain)
 
     cf = CloudflareClient()
     zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)

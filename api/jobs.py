@@ -600,12 +600,16 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
 
         _upsert_shard(sb, domain, client_id=client_id, status="destroying")
 
-        # Step 1: Destroy VPS
+        # Step 1: Destroy VPS, then CONFIRM it is actually gone.
         # Distinguish "already gone" (404 / not found) from "really failed".
         # The old behaviour swallowed both as a warning and let the job continue,
         # which left orphan VPSes billing forever (~£3.70/mo each on Webdock).
+        # We only mark the shard destroyed once the VPS is confirmed gone; a
+        # warn/fail leaves it in a distinct 'destroy_incomplete' state that
+        # reconcile_fleet.py can catch, rather than a silently-billing orphan.
         _append_log(sb, job_id, "Destroying VPS", step=1)
         vps = state.get("vps")
+        vps_confirmed_gone = True  # no VPS recorded => nothing to bill
         if vps and vps.get("id"):
             provider = vps.get("provider", "webdock")
             try:
@@ -625,32 +629,73 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
                 if already_gone:
                     _append_log(sb, job_id, f"VPS {vps['id']} already gone — treating as success")
                 else:
-                    # Hard fail: leave the shard in 'destroying' so the operator
-                    # knows there's an orphan VPS to chase. Re-running destroy
-                    # is safe (idempotent on DNS + state archival).
-                    _append_log(sb, job_id, f"VPS DESTROY FAILED: {exc}")
-                    _append_log(sb, job_id,
-                        "Shard will NOT be marked destroyed. The Webdock VPS is "
-                        "likely still running and billing. Investigate in the Webdock "
-                        "dashboard or re-run destroy after fixing the underlying issue.")
-                    raise
+                    # Warn/fail: do NOT trust that the VPS is gone. Fall through
+                    # to the state-cleanup legs, but confirm existence below and
+                    # leave the shard in destroy_incomplete if it is still there.
+                    _append_log(sb, job_id, f"VPS DESTROY WARNING: {exc}")
+                    vps_confirmed_gone = False
 
-        # Step 2: Delete DNS records (use the client's Cloudflare account)
+            # Confirm with a fresh read for Webdock (the destroy call can warn
+            # while the server is actually gone, or succeed while it lingers).
+            if provider == "webdock" and ctx.webdock:
+                from lib.teardown import webdock_server_exists as _wse
+                still_there = _wse(ctx.webdock, vps.get("id"))
+                if still_there is True:
+                    vps_confirmed_gone = False
+                    _append_log(sb, job_id,
+                        f"Webdock still reports server {vps['id']} present — "
+                        "shard will be left in 'destroy_incomplete' (still billing).")
+                elif still_there is False:
+                    vps_confirmed_gone = True
+                # still_there is None => inconclusive; keep whatever the destroy
+                # call implied above.
+
+        # Step 2: Remove Instantly warmup seats + Bison senders (both legs added
+        # 2026-07: previously NO destroy path removed these, which is why torn
+        # down shards kept 200+ zombie Instantly seats and orphan Bison senders).
+        # Both legs are best-effort and idempotent; a failure here must not block
+        # the VPS/DNS teardown, so it is logged and reconciliation catches leftovers.
+        _append_log(sb, job_id, "Removing Instantly warmup seats + Bison senders", step=2)
+        try:
+            _teardown_offboard_shard(sb, ctx, domain, job_id)
+        except Exception as exc:  # noqa: BLE001
+            _append_log(sb, job_id, f"Off-board warning (reconcile will catch leftovers): {exc}")
+
+        # Step 3: Delete DNS records (use the client's Cloudflare account).
         # Landing-page teardown needs nothing extra here: the apex A record
         # goes with delete_all_records below and the Caddy vhost dies with
         # the VPS. delete_redirect_rules is a harmless no-op for landing-page
         # clients (no redirect rule was created for them).
-        _append_log(sb, job_id, "Deleting DNS records", step=2)
+        #
+        # Force-complete path (covers reachosdfy.com): if the VPS is already gone
+        # and Cloudflare's DNS-delete 403s (e.g. a token that has lost Rulesets/
+        # DNS-edit permission), we must NOT wedge the teardown. We log the CF
+        # failure and continue to state cleanup so the shard can reach a terminal
+        # state instead of getting stuck in destruction_failed forever.
+        _append_log(sb, job_id, "Deleting DNS records", step=3)
         cf = ctx.cloudflare
         zone_id = state.get("cloudflare_zone_id") or cf.get_zone_id(domain)
         if zone_id:
-            removed = cf.delete_all_records(zone_id)
-            _append_log(sb, job_id, f"Removed {removed} DNS records")
-            removed_rules = cf.delete_redirect_rules(zone_id, domain)
-            _append_log(sb, job_id, f"Removed {removed_rules} redirect rules")
+            try:
+                removed = cf.delete_all_records(zone_id)
+                _append_log(sb, job_id, f"Removed {removed} DNS records")
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                if ("403" in msg or "401" in msg) and vps_confirmed_gone:
+                    _append_log(sb, job_id,
+                        f"DNS delete failed ({str(exc)[:150]}); VPS already gone so "
+                        "NOT wedging teardown. Records are inert without the VPS; "
+                        "clean the zone manually or via reconcile.")
+                else:
+                    raise
+            try:
+                removed_rules = cf.delete_redirect_rules(zone_id, domain)
+                _append_log(sb, job_id, f"Removed {removed_rules} redirect rules")
+            except Exception as exc:  # noqa: BLE001
+                _append_log(sb, job_id, f"Redirect-rule cleanup skipped: {str(exc)[:150]}")
 
-        # Step 3: Archive state
-        _append_log(sb, job_id, "Archiving state files", step=3)
+        # Step 4: Archive state
+        _append_log(sb, job_id, "Archiving state files", step=4)
         archive_dir = SHARDS_DIR / "archived"
         archive_dir.mkdir(exist_ok=True)
         timestamp = time.strftime("%Y%m%dT%H%M%S")
@@ -660,17 +705,97 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
         if bison_csv.exists():
             shutil.move(str(bison_csv), archive_dir / f"{domain}-{timestamp}_bison.csv")
 
-        _upsert_shard(sb, domain,
-            client_id=client_id,
-            status="destroyed",
-            destroyed_at=datetime.now(timezone.utc).isoformat(),
-        )
-        _append_log(sb, job_id, "Shard destroyed and archived", step=4)
-        _complete_job(sb, job_id)
+        # Step 5: Reconcile flags. bison_loaded is ALWAYS cleared as part of
+        # teardown now (the stale bison_loaded=true drift class came from this
+        # never being reset). Status is destroyed only when the VPS is confirmed
+        # gone; otherwise destroy_incomplete so reconciliation flags the orphan.
+        if vps_confirmed_gone:
+            _upsert_shard(sb, domain,
+                client_id=client_id,
+                status="destroyed",
+                destroyed_at=datetime.now(timezone.utc).isoformat(),
+                bison_loaded=False,
+            )
+            _append_log(sb, job_id, "Shard destroyed and archived", step=5)
+            _complete_job(sb, job_id)
+        else:
+            _upsert_shard(sb, domain,
+                client_id=client_id,
+                status="destroy_incomplete",
+                bison_loaded=False,
+            )
+            _append_log(sb, job_id,
+                "Shard left in 'destroy_incomplete': the Webdock VPS could not be "
+                "confirmed destroyed and is likely still billing. DNS/Instantly/Bison "
+                "cleanup completed. Re-run destroy after fixing the VPS, or use "
+                "reconcile_fleet.py which lists the orphan for approval.", step=5)
+            _complete_job(sb, job_id,
+                error="destroy_incomplete: VPS not confirmed gone (still billing)")
 
     except Exception as exc:
         _append_log(sb, job_id, f"FAILED: {exc}")
         _complete_job(sb, job_id, error=f"{type(exc).__name__}: {exc}")
+
+
+def _teardown_offboard_shard(sb: Client, ctx: ClientContext, domain: str, job_id: str) -> None:
+    """Remove a shard's Instantly warmup seats and Bison senders.
+
+    Shared teardown leg used by run_destroy. Reads the shard's mailbox emails and
+    Bison sender ids from instantly_warmup_state (populated at load-to-bison), so
+    it works even when the shard's CSV has been archived. Idempotent + best-effort.
+    """
+    from lib.teardown import registrable_root_domain, remove_bison_senders, remove_instantly_seats
+
+    root = registrable_root_domain(domain)
+    rows = (
+        sb.table("instantly_warmup_state")
+        .select("email, bison_sender_email_id, workspace_id")
+        .or_(f"root_domain.eq.{root},domain.eq.{domain}")
+        .execute()
+        .data
+    ) or []
+    if not rows:
+        _append_log(sb, job_id, f"No instantly_warmup_state rows for {domain}; nothing to off-board")
+        return
+
+    emails = [r["email"] for r in rows if r.get("email")]
+    sender_ids = [r["bison_sender_email_id"] for r in rows if r.get("bison_sender_email_id")]
+
+    # Instantly seats (INSTANTLY_API_KEY from env; no per-client scoping needed).
+    inst = remove_instantly_seats(emails)
+    _append_log(sb, job_id,
+        f"Instantly: deleted {inst['deleted']}, already-gone {inst['already_gone']} "
+        f"of {inst['requested']}"
+        + (f"; {len(inst['errors'])} errors" if inst["errors"] else ""))
+
+    # Bison senders: use the shard's own workspace token. Match the workspace_id
+    # on the warmup rows to one of the client's configured Bison workspaces.
+    ws_ids = {str(r.get("workspace_id")) for r in rows if r.get("workspace_id") is not None}
+    ws = None
+    for w in ctx.workspaces:
+        if w.workspace_id and str(w.workspace_id) in ws_ids:
+            ws = w
+            break
+    if ws is None:
+        ws = ctx.default_workspace
+    if ws is None:
+        _append_log(sb, job_id,
+            "No Bison workspace resolved for shard; leaving senders for reconcile.")
+    else:
+        bres = remove_bison_senders(ws._api_key, ws.base_url, sender_ids)
+        _append_log(sb, job_id,
+            f"Bison: deleted {bres['deleted']}, already-gone {bres['already_gone']} "
+            f"of {bres['requested']}"
+            + (f"; {len(bres['errors'])} errors" if bres["errors"] else ""))
+
+    # Flip the warmup rows to a terminal 'removed' state so they stop being
+    # polled and reconciliation sees them as handled.
+    try:
+        sb.table("instantly_warmup_state").update(
+            {"status": "removed", "last_error": None}
+        ).or_(f"root_domain.eq.{root},domain.eq.{domain}").execute()
+    except Exception as exc:  # noqa: BLE001
+        _append_log(sb, job_id, f"warmup_state status flip warning: {str(exc)[:150]}")
 
 
 # ---------------------------------------------------------------------------
@@ -1135,9 +1260,12 @@ def run_load_to_bison(
                         from lib.instantly_api import create_account as _ic
                         _ws_id = int(target_ws.workspace_id) if target_ws.workspace_id else None
                         _domain = email_addr.split("@", 1)[1].lower()
-                        # root = last two dot-segments (sufficient for our .com/.co/.org domains)
-                        _parts = _domain.split(".")
-                        _root = ".".join(_parts[-2:]) if len(_parts) >= 2 else _domain
+                        # Registrable root ("eTLD+1"). Multi-label TLDs like
+                        # .co.uk must keep 3 labels (10xmanagers.co.uk), NOT be
+                        # truncated to the bare suffix (co.uk) which breaks every
+                        # join on instantly_warmup_state.root_domain.
+                        from lib.teardown import registrable_root_domain as _rrd
+                        _root = _rrd(_domain)
                         _row = {
                             "workspace_id": _ws_id,
                             "workspace_name": ws_name,

@@ -110,3 +110,43 @@ def enable_warmup(emails: Iterable[str]) -> dict:
             response=r,
         )
     return r.json()
+
+
+def disable_warmup(emails: Iterable[str]) -> dict:
+    """Turn warmup OFF for the given accounts. Used when tearing a shard down —
+    stops further peer warmup mail before the account is deleted. Mirrors the
+    cron-side wrapper (warmup-poller/instantly_admin.py:disable_warmup)."""
+    emails_list = list(emails)
+    if not emails_list:
+        return {"skipped": "no emails"}
+    r = requests.post(
+        f"{INSTANTLY_BASE_URL}/accounts/warmup/disable",
+        headers=_headers(),
+        json={"emails": emails_list},
+        timeout=60,
+    )
+    if not r.ok:
+        raise requests.HTTPError(
+            f"{r.status_code} on POST /accounts/warmup/disable: {r.text[:400]}",
+            response=r,
+        )
+    return r.json()
+
+
+def delete_account(email_or_id: str) -> dict:
+    """DELETE an account from Instantly (identified by EMAIL). Idempotent from
+    the caller's side: a 404 raises requests.HTTPError which teardown treats as
+    'already gone'. Content-Type must be ABSENT on this endpoint (Instantly
+    enforces 'body must be null'); mirrors the cron-side wrapper."""
+    url = f"{INSTANTLY_BASE_URL}/accounts/{email_or_id}"
+    headers = {"Authorization": f"Bearer {_api_key()}", "Accept": "application/json"}
+    r = requests.delete(url, headers=headers, timeout=60)
+    if not r.ok:
+        raise requests.HTTPError(
+            f"{r.status_code} on DELETE /accounts/{email_or_id}: {r.text[:400]}",
+            response=r,
+        )
+    try:
+        return r.json()
+    except ValueError:
+        return {"status": "deleted", "email": email_or_id}
