@@ -25,6 +25,7 @@ per-workspace token from the caller; Webdock receives an explicit WebdockClient.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable
 
 import requests
@@ -127,6 +128,11 @@ def remove_instantly_seats(emails: Iterable[str]) -> dict[str, Any]:
         "deleted": 0,
         "already_gone": 0,
         "errors": [],
+        # The set of emails CONFIRMED out of Instantly (deleted or already gone).
+        # Callers must mark DB rows 'removed' ONLY for emails in this set - never
+        # for the whole batch - or the DB races ahead of Instantly reality when
+        # deletes rate-limit partway (the zombie-seat drift bug).
+        "removed_emails": set(),
     }
     if not email_list:
         return result
@@ -138,19 +144,42 @@ def remove_instantly_seats(emails: Iterable[str]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - best-effort, deletion still runs
         result["errors"].append(f"disable_warmup: {str(exc)[:200]}")
 
+    def _is_rate_limit(exc: Exception) -> bool:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        body = (str(exc) or "").lower()
+        return status == 429 or "429" in body or "rate limit" in body or "too many" in body
+
     for email in email_list:
-        try:
-            instantly_api.delete_account(email)
-            result["deleted"] += 1
-        except requests.HTTPError as exc:
-            body = (str(exc) or "").lower()
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status == 404 or "404" in body or "not found" in body:
-                result["already_gone"] += 1
-            else:
+        # Instantly rate-limits bulk deletes (dies after ~100 rapid calls). Retry
+        # with exponential backoff on 429 so a whole-fleet sweep actually drains.
+        for attempt in range(6):
+            try:
+                instantly_api.delete_account(email)
+                result["deleted"] += 1
+                result["removed_emails"].add(email)
+                break
+            except requests.HTTPError as exc:
+                body = (str(exc) or "").lower()
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 404 or "404" in body or "not found" in body:
+                    result["already_gone"] += 1
+                    result["removed_emails"].add(email)
+                    break
+                if _is_rate_limit(exc) and attempt < 5:
+                    time.sleep(2 ** attempt)  # 1,2,4,8,16s
+                    continue
                 result["errors"].append(f"{email}: {str(exc)[:150]}")
-        except Exception as exc:  # noqa: BLE001
-            result["errors"].append(f"{email}: {str(exc)[:150]}")
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _is_rate_limit(exc) and attempt < 5:
+                    time.sleep(2 ** attempt)
+                    continue
+                result["errors"].append(f"{email}: {str(exc)[:150]}")
+                break
+        else:
+            continue
+        # Gentle pace between accounts to stay under the rate limit in the first place.
+        time.sleep(0.3)
     return result
 
 

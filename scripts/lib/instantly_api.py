@@ -133,6 +133,40 @@ def disable_warmup(emails: Iterable[str]) -> dict:
     return r.json()
 
 
+def list_accounts(search: str | None = None, limit: int = 100) -> list[dict]:
+    """List Instantly accounts, optionally filtered by `search` (matches email
+    substring, e.g. a root domain). Paginates via next_starting_after until
+    drained. Used for reality-based reconciliation: what accounts ACTUALLY
+    exist in Instantly, independent of our DB state."""
+    out: list[dict] = []
+    starting_after: str | None = None
+    while True:
+        params: dict = {"limit": limit}
+        if search:
+            params["search"] = search
+        if starting_after:
+            params["starting_after"] = starting_after
+        r = requests.get(
+            f"{INSTANTLY_BASE_URL}/accounts",
+            headers=_headers(content_type=False),
+            params=params,
+            timeout=60,
+        )
+        if not r.ok:
+            raise requests.HTTPError(
+                f"{r.status_code} on GET /accounts: {r.text[:300]}", response=r
+            )
+        body = r.json()
+        items = body.get("items", body) if isinstance(body, dict) else body
+        if not items:
+            break
+        out.extend(items)
+        starting_after = body.get("next_starting_after") if isinstance(body, dict) else None
+        if not starting_after or len(items) < limit:
+            break
+    return out
+
+
 def delete_account(email_or_id: str) -> dict:
     """DELETE an account from Instantly (identified by EMAIL). Idempotent from
     the caller's side: a 404 raises requests.HTTPError which teardown treats as

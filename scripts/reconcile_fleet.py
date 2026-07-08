@@ -183,14 +183,40 @@ def reconcile_zombie_instantly(
     dead shards. Disable warmup + delete account + flip row to 'removed', and
     delete the matching Bison senders."""
     _echo_header("CLASS 3: ZOMBIE Instantly seats (+ orphan Bison senders)")
+    from lib import instantly_api  # local import: env-dependent module
+
     dead_roots = {registrable_root_domain(s["domain"]) for s in shards if s.get("status") in DEAD_STATUSES}
-    # A row is a zombie if its shard is dead but the row is not already terminal.
+
+    # Reality-based detection: a seat is a zombie if the shard is dead AND the
+    # account STILL EXISTS in Instantly - regardless of what our DB status says.
+    # This is deliberate: trusting the DB `status` field let an earlier run mark
+    # rows 'removed' while the Instantly delete had actually rate-limited and
+    # failed, hiding live seats. We now ask Instantly what really exists so the
+    # sweep self-heals rows that were mis-marked. Fall back to DB-status detection
+    # only if the Instantly list call fails.
     terminal = {"removed", "deleted"}
-    zombies = [
-        r for r in warmup_rows
-        if (r.get("root_domain") in dead_roots or registrable_root_domain(r.get("domain") or "") in dead_roots)
-        and (r.get("status") not in terminal)
-    ]
+    rows_by_email = {}
+    for r in warmup_rows:
+        em = (r.get("email") or "").strip().lower()
+        if em:
+            rows_by_email[em] = r
+    zombies = []
+    try:
+        for root in sorted(dead_roots):
+            for acct in instantly_api.list_accounts(search=root):
+                em = (acct.get("email") or "").strip().lower()
+                if not em or registrable_root_domain(em.split("@")[-1]) not in dead_roots:
+                    continue
+                # Attach the DB row if we have one; synthesise a minimal row if not
+                # (a live Instantly account with no DB row is still a real zombie).
+                zombies.append(rows_by_email.get(em) or {"email": em, "root_domain": root, "id": None})
+    except Exception as exc:  # noqa: BLE001 - Instantly list failed, fall back to DB view
+        click.echo(f"  (Instantly reality check failed: {str(exc)[:120]}; falling back to DB status)")
+        zombies = [
+            r for r in warmup_rows
+            if (r.get("root_domain") in dead_roots or registrable_root_domain(r.get("domain") or "") in dead_roots)
+            and (r.get("status") not in terminal)
+        ]
     # Group by root for reporting + by workspace for Bison removal.
     by_root: dict[str, list[dict]] = {}
     for r in zombies:
@@ -205,17 +231,21 @@ def reconcile_zombie_instantly(
     fixed_seats = 0
     fixed_senders = 0
     if fix and zombies:
-        # Instantly: batch delete all zombie emails.
+        # Instantly: delete with rate-limit backoff; capture WHICH emails were
+        # actually removed so we only mark those rows terminal.
         emails = [r["email"] for r in zombies if r.get("email")]
         inst = remove_instantly_seats(emails)
-        fixed_seats = inst["deleted"] + inst["already_gone"]
+        removed = inst["removed_emails"]  # set of confirmed-gone emails
+        fixed_seats = len(removed)
         click.echo(
-            f"  Instantly: deleted {inst['deleted']}, already-gone {inst['already_gone']}"
-            + (f", {len(inst['errors'])} errors" if inst["errors"] else "")
+            f"  Instantly: confirmed-removed {fixed_seats}/{len(emails)}"
+            + (f", {len(inst['errors'])} still failing (left for re-run)" if inst["errors"] else "")
         )
-        # Bison senders: group by workspace, switch, delete.
+        # Bison senders: only for rows whose Instantly seat is confirmed gone.
         by_ws: dict[str, list[int]] = {}
         for r in zombies:
+            if (r.get("email") or "").strip().lower() not in removed:
+                continue
             ws = r.get("workspace_id")
             sid = r.get("bison_sender_email_id")
             if ws is not None and sid is not None:
@@ -232,13 +262,18 @@ def reconcile_zombie_instantly(
                 f"  Bison ws {ws_id}: deleted {bres['deleted']}, already-gone {bres['already_gone']}"
                 + (f", {len(bres['errors'])} errors" if bres["errors"] else "")
             )
-        # Flip rows terminal.
-        ids = [r["id"] for r in zombies if r.get("id") is not None]
+        # Flip terminal ONLY for confirmed-removed emails with a DB row id.
+        ids = [
+            r["id"] for r in zombies
+            if r.get("id") is not None and (r.get("email") or "").strip().lower() in removed
+        ]
         for i in range(0, len(ids), 500):
             sb.table("instantly_warmup_state").update(
                 {"status": "removed", "last_error": None}
             ).in_("id", ids[i : i + 500]).execute()
         click.echo(f"  FIXED: {fixed_seats} Instantly seats, {fixed_senders} Bison senders, {len(ids)} rows marked removed")
+        if inst["errors"]:
+            click.echo(f"  {len(inst['errors'])} seat(s) still live (rate-limited/error) - re-run to finish.")
     return {"class": "zombie-instantly", "drift": len(zombies), "fixed": fixed_seats}
 
 
