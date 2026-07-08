@@ -69,6 +69,8 @@ from lib.teardown import (  # type: ignore
     remove_bison_senders,
     remove_instantly_seats,
     webdock_find_server_by_ip,
+    webdock_list_servers,
+    webdock_server_ipv4,
 )
 
 BISON_BASE = os.environ.get("BISON_BASE_URL", "https://send.spamproofed.com")
@@ -120,7 +122,7 @@ def _all_warmup_rows(sb) -> list[dict]:
 
 def _shards(sb, client_id: str | None) -> list[dict]:
     q = sb.table("infra_shards").select(
-        "domain, status, bison_loaded, vps_ip, client_id, clients(slug)"
+        "domain, status, bison_loaded, vps_ip, destroyed_at, client_id, clients(slug)"
     )
     if client_id:
         q = q.eq("client_id", client_id)
@@ -304,46 +306,73 @@ def reconcile_root_domain(sb, warmup_rows: list[dict], fix: bool) -> dict:
     return {"class": "root-domain", "drift": len(drift), "fixed": fixed}
 
 
-def reconcile_orphan_vps(sb, shards: list[dict], client_id: str | None, approvals: list[str]) -> dict:
-    """REPORT-ONLY: shard marked dead but Webdock still has a running server.
+# Non-shard infra servers that must never be flagged as orphans (control plane).
+INFRA_SERVER_IPS = {"193.180.211.74", "193.180.211.174"}  # infraapi1, goworkers
+INFRA_SERVER_SLUG_HINTS = ("infraapi", "goworker")
 
-    Destroying a VPS is spend + irreversible, so this is never auto-applied. We
-    verify against Webdock per client and list the exact destroy command.
+
+def reconcile_orphan_vps(sb, shards: list[dict], client_id: str | None, approvals: list[str]) -> dict:
+    """REPORT-ONLY: a running Webdock server that no live shard accounts for.
+
+    Detects both directions the old logic missed:
+      * a server whose shard is dead (status in DEAD_STATUSES OR destroyed_at set
+        OR bison_loaded=false) - the old check only looked at `status`, so a shard
+        left status='active' with destroyed_at set (e.g. 10xleaders.co) slipped through;
+      * a running server with NO shard row at all (e.g. an untracked test box).
+    Correctly EXCLUDES Webdock `pendingDeletion` servers (revoking free at
+    month-end - not orphans) and the control-plane infra boxes.
+    Destroying a VPS is spend + irreversible, so this is never auto-applied.
     """
     _echo_header("CLASS 1: ORPHAN-BILLED VPS (report only)")
-    dead_with_ip = [s for s in shards if s.get("status") in DEAD_STATUSES and s.get("vps_ip")]
-    if not dead_with_ip:
-        click.echo("  No dead shards with a recorded vps_ip to check.")
-        return {"class": "orphan-vps", "drift": 0, "fixed": 0}
 
-    # Load client contexts lazily (Webdock token per client).
+    # Which shard (if any) owns each IP, and is that shard live?
+    shard_by_ip: dict[str, dict] = {s["vps_ip"]: s for s in shards if s.get("vps_ip")}
+
+    def _shard_is_live(s: dict) -> bool:
+        if s.get("status") in DEAD_STATUSES:
+            return False
+        if s.get("destroyed_at"):
+            return False
+        return bool(s.get("bison_loaded"))
+
+    client_ids = {client_id} if client_id else {s["client_id"] for s in shards if s.get("client_id")}
     ctx_cache: dict[str, object] = {}
-    orphans = []
-    for s in dead_with_ip:
-        cid = s["client_id"]
-        if cid not in ctx_cache:
-            try:
-                ctx_cache[cid] = load_client_context_by_id(cid)
-            except Exception as exc:  # noqa: BLE001
-                click.echo(f"  {s['domain']}: cannot load client context ({str(exc)[:80]}) - skip")
-                ctx_cache[cid] = None
-        ctx = ctx_cache[cid]
-        wd = getattr(ctx, "webdock", None) if ctx else None
+    orphans: list[tuple[str, str, str]] = []   # (slug, ip, reason)
+    winding_down = 0
+    for cid in client_ids:
+        try:
+            ctx_cache[cid] = load_client_context_by_id(cid)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  client {cid}: cannot load context ({str(exc)[:80]}) - skip")
+            continue
+        wd = getattr(ctx_cache[cid], "webdock", None)
         if wd is None:
             continue
-        srv = webdock_find_server_by_ip(wd, s.get("vps_ip"))
-        if srv:
-            slug = srv.get("slug") or srv.get("id")
-            orphans.append((s, slug))
-            click.echo(f"    ORPHAN {s['domain']:<30} ip={s['vps_ip']} slug={slug} status={s.get('status')}")
+        for srv in webdock_list_servers(wd):
+            ip = webdock_server_ipv4(srv)
+            slug = str(srv.get("slug") or srv.get("id") or "?")
+            if not ip or ip in INFRA_SERVER_IPS or any(h in slug for h in INFRA_SERVER_SLUG_HINTS):
+                continue
+            if srv.get("pendingDeletion"):
+                winding_down += 1  # revoking free at month-end - fine, not an orphan
+                continue
+            owner = shard_by_ip.get(ip)
+            if owner is None:
+                orphans.append((slug, ip, "no shard row (untracked server)"))
+            elif not _shard_is_live(owner):
+                orphans.append((slug, ip, f"shard {owner['domain']} is dead (status={owner.get('status')}, destroyed_at set={bool(owner.get('destroyed_at'))})"))
+
+    if winding_down:
+        click.echo(f"  ({winding_down} server(s) in pendingDeletion - revoking free at month-end, no action)")
     if not orphans:
-        click.echo("  No orphan-billed VPSes found (all dead shards' servers confirmed gone).")
+        click.echo("  No orphan-billed VPSes found.")
     else:
-        for s, slug in orphans:
+        for slug, ip, reason in orphans:
+            click.echo(f"    ORPHAN slug={slug:<16} ip={ip:<18} {reason}")
             approvals.append(
-                f"[orphan-vps] Webdock server {slug} ({s['vps_ip']}, {s['domain']}) still running "
-                f"for a dead shard. Destroy with: python scripts/destroy_shard.py --domain {s['domain']} "
-                f"(or delete slug {slug} in the Webdock dashboard). SPEND/IRREVERSIBLE."
+                f"[orphan-vps] Webdock server {slug} ({ip}) is running but {reason}. "
+                f"Verify no-send, then delete slug {slug} in the Webdock dashboard "
+                f"(or destroy via the shard's domain). SPEND/IRREVERSIBLE."
             )
     return {"class": "orphan-vps", "drift": len(orphans), "fixed": 0}
 

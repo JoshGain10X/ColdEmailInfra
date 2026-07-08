@@ -256,6 +256,32 @@ def webdock_server_exists(webdock_client, slug: str | None) -> bool | None:
         return None
 
 
+def webdock_list_servers(webdock_client) -> list[dict]:
+    """Return all raw Webdock server dicts for this client account, or []. Never
+    raises. Each dict carries slug, ipv4, status, and the `pendingDeletion`
+    boolean (the authoritative wind-down flag - a pendingDeletion server is
+    revoking free at month-end and is NOT an orphan)."""
+    if webdock_client is None:
+        return []
+    try:
+        sdk = getattr(webdock_client, "_sdk", None)
+        if sdk is None:
+            return []
+        resp = sdk.make_request("servers", requestType="GET")
+        data = resp.get("data") if isinstance(resp, dict) else resp
+        return list(data or [])
+    except Exception:  # noqa: BLE001 - reconciliation must not crash on this
+        return []
+
+
+def webdock_server_ipv4(srv: dict) -> str | None:
+    for key in ("ipv4", "ipv4Address", "ip", "mainIp", "ipAddress"):
+        v = srv.get(key)
+        if v:
+            return str(v)
+    return None
+
+
 def webdock_find_server_by_ip(webdock_client, ip: str | None) -> dict | None:
     """Best-effort lookup of a running Webdock server by its IPv4.
 
