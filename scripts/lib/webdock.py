@@ -72,6 +72,10 @@ class WebdockClient:
             "ip6": WebdockClient._extract_ipv6(raw),
             "status": raw.get("status"),
             "display_name": raw.get("name"),
+            # pendingDeletion=true means a DELETE has been accepted and the
+            # server revokes at month-end - teardown treats this as destroyed.
+            "pendingDeletion": raw.get("pendingDeletion"),
+            "nextActionDate": raw.get("nextActionDate"),
         }
 
     # ------------------------------------------------------------------

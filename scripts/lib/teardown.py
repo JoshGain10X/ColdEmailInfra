@@ -239,7 +239,14 @@ def remove_bison_senders(bison_token: str, base_url: str, sender_ids: Iterable[i
 
 
 def webdock_server_exists(webdock_client, slug: str | None) -> bool | None:
-    """Return True/False if we can determine whether a Webdock server exists.
+    """Return True/False for whether a Webdock server is still LIVE (billing).
+
+    A Webdock DELETE does not remove the server immediately - it flips it to
+    stopped + pendingDeletion=true and revokes at the start of next month. That
+    is a SUCCESSFUL destroy (billing stops, no further sends), so a
+    pendingDeletion server counts as gone here - otherwise every teardown would
+    be flagged 'destroy_incomplete'. Only a server that is neither absent nor
+    pendingDeletion is still live.
 
     Returns None when we cannot tell (no client, no slug, or a transient API
     error) so callers can distinguish "confirmed gone" from "unknown" and avoid
@@ -249,7 +256,11 @@ def webdock_server_exists(webdock_client, slug: str | None) -> bool | None:
         return None
     try:
         inst = webdock_client.get_instance(slug)
-        return bool(inst and inst.get("id"))
+        if not inst or not inst.get("id"):
+            return False
+        if inst.get("pendingDeletion"):
+            return False  # revocation scheduled - destroy succeeded
+        return True
     except Exception as exc:  # noqa: BLE001
         if "404" in str(exc) or "not found" in str(exc).lower():
             return False
