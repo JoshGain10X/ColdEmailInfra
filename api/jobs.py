@@ -1917,8 +1917,10 @@ def run_placement_test(
         # failed 0/8 even though real campaign mail flows fine. No SSH needed.
         import smtplib as _smtplib
         import ssl as _ssl
-        import time as _time
         from email.message import EmailMessage as _EmailMessage
+        # _time is the module-level `import time as _time`; do NOT re-import it
+        # locally here - an earlier line in this function (ts = int(_time.time()))
+        # already uses it, and a local import would shadow it into an UnboundLocalError.
         _ctx = _ssl.create_default_context()
         _ctx.check_hostname = False
         _ctx.verify_mode = _ssl.CERT_NONE
