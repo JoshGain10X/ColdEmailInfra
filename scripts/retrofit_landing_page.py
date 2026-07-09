@@ -3,11 +3,13 @@
 
 For every live shard of a client with client_settings.landing_page_url set,
 this script:
-  1. Flips the apex A record to proxied=False (grey cloud) so Caddy on the
-     shard VPS terminates TLS for https://<root> itself.
-  2. Adds the landing-page vhost to the shard's Caddyfile via SSH and
-     reloads Caddy. Idempotent - the managed block is replaced, never
-     duplicated (see lib.mailserver.landing_vhost_block).
+  1. Flips the apex AND every sending-subdomain A record to proxied=False
+     (grey cloud) so Caddy on the shard VPS terminates TLS for https://<root>
+     and https://<sub>.<root> itself. A sub left orange-cloud 525s (CF proxies
+     to an origin with no cert for that host).
+  2. Adds the landing-page vhost (apex + all subs in one site address) to the
+     shard's Caddyfile via SSH and reloads Caddy. Idempotent - the managed
+     block is replaced, never duplicated (see lib.mailserver.landing_vhost_block).
   3. Attempts to delete the legacy apex redirect rule. The current API
      token 403s on the Rulesets API, so failure is tolerated and the rule
      is simply left in place (it is unreachable once the apex is
@@ -50,6 +52,11 @@ from lib.state import ShardState
 
 
 RETROFIT_STEP = "landing_page_configured"
+# Separate marker for the subdomain fix (added after the apex-only retrofit
+# shipped). Shards with RETROFIT_STEP done but SUBDOMAIN_STEP not done still
+# need their sending subdomains grey-clouded + added to the Caddy vhost, so
+# the skip guard requires BOTH.
+SUBDOMAIN_STEP = "landing_subdomains_configured"
 
 # Strings we expect somewhere in the landing page body. Either is enough.
 VERIFY_MARKERS = ("Let's end the theatre", "10X Managers")
@@ -140,8 +147,10 @@ def _retrofit_one(
     state = ShardState(domain)
     if not state.path.exists():
         return {"domain": domain, "skipped": "no_state_file"}
-    if state.is_step_done(RETROFIT_STEP):
+    if state.is_step_done(RETROFIT_STEP) and state.is_step_done(SUBDOMAIN_STEP):
         return {"domain": domain, "skipped": "already_retrofitted"}
+
+    subs = state.get("subdomains") or []
 
     vps_state = state.get("vps") or {}
     vps_ip = vps_state.get("ip") or shard_row.get("vps_ip")
@@ -152,10 +161,17 @@ def _retrofit_one(
     click.echo(f"  client      : {client_slug}")
     click.echo(f"  vps_ip      : {vps_ip}")
     click.echo(f"  landing_url : {landing_url}")
+    click.echo(f"  subdomains  : {', '.join(subs) if subs else '(none in state)'}")
 
     if dry_run:
-        click.echo("  DRY-RUN: would flip apex to grey-cloud, add Caddy vhost, verify HTTPS")
-        return {"domain": domain, "dry_run": True}
+        sub_hosts = [f"{s}.{domain}" for s in subs]
+        click.echo("  DRY-RUN: would install Caddy vhost for "
+                   f"{domain}" + (f" + {len(sub_hosts)} sub(s)" if sub_hosts else ""))
+        click.echo("  DRY-RUN: would flip apex + "
+                   f"{len(sub_hosts)} subdomain A record(s) to grey-cloud, then verify HTTPS")
+        for h in sub_hosts:
+            click.echo(f"             - {h}")
+        return {"domain": domain, "dry_run": True, "subdomains": subs}
 
     if client_slug not in ctx_cache:
         ctx_cache[client_slug] = load_client_context_by_slug(client_slug)
@@ -171,14 +187,23 @@ def _retrofit_one(
     ms = MailserverClient(vps_ip, ssh_key, user=_ssh_user(state))
     ms.connect()
     try:
-        ms.install_landing_page(domain, landing_url, bootstrap=bootstrap_caddy)
+        ms.install_landing_page(
+            domain, landing_url, bootstrap=bootstrap_caddy, subdomains=subs
+        )
     finally:
         ms.close()
-    click.echo("  ✓ Caddy vhost installed + reloaded")
+    click.echo(f"  ✓ Caddy vhost installed + reloaded (apex + {len(subs)} sub(s))")
 
-    # (b) Apex A record -> grey cloud so Caddy terminates TLS itself
+    # (b) Apex + each sending subdomain A record -> grey cloud so Caddy
+    # terminates TLS itself. An orange-cloud sub 525s (CF proxies to an
+    # origin with no cert for that host). mail.<sub> hosts are left alone -
+    # they carry SMTP, not web, and are already grey.
     cf.upsert_record(zone_id, "A", domain, vps_ip, proxied=False)
     click.echo("  ✓ apex A record set to proxied=False")
+    for sub in subs:
+        cf.upsert_record(zone_id, "A", f"{sub}.{domain}", vps_ip, proxied=False)
+    if subs:
+        click.echo(f"  ✓ {len(subs)} subdomain A record(s) set to proxied=False")
 
     # (c) Best-effort removal of the legacy apex redirect rule. The rule is
     # unreachable anyway once the apex is grey-cloud, so a 403 here is fine.
@@ -193,18 +218,36 @@ def _retrofit_one(
         click.echo(f"  - redirect rule left in place (token lacks ruleset "
                    f"permission): {str(exc)[:150]}")
 
-    # (d) Verify the landing page actually serves over HTTPS
+    # (d) Verify the landing page actually serves over HTTPS on the apex
     ok, detail = _verify_landing(domain)
     if not ok:
         return {"domain": domain, "error": f"verify_failed: {detail}"}
     click.echo(f"  ✓ verified https://{domain}/ ({detail})")
 
+    # (d2) Spot-check the first sending subdomain. LE issuance for the new
+    # hostnames can lag the apex, so this is best-effort: a miss here does
+    # not fail the retrofit (the vhost + DNS are correct; the cert will land
+    # on retry), it just gets flagged for a follow-up eyeball.
+    sub_note = ""
+    if subs:
+        sub_host = f"{subs[0]}.{domain}"
+        sub_ok, sub_detail = _verify_landing(sub_host)
+        if sub_ok:
+            click.echo(f"  ✓ verified https://{sub_host}/ ({sub_detail})")
+        else:
+            sub_note = f"subdomain {sub_host} not yet serving ({sub_detail}) - recheck shortly"
+            click.echo(f"  ! {sub_note}")
+
     # (e) Idempotency flags: shard state file + infra_shards.step_flags
     state.mark_step_done(RETROFIT_STEP)
+    state.mark_step_done(SUBDOMAIN_STEP)
     _set_shard_landing_flag(sb, domain, shard_row["client_id"])
     click.echo("  ✓ flags set (state + infra_shards.step_flags.landing_page)")
 
-    return {"domain": domain, "ok": True}
+    result = {"domain": domain, "ok": True}
+    if sub_note:
+        result["warning"] = sub_note
+    return result
 
 
 @click.command()

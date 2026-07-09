@@ -360,7 +360,13 @@ def run_deploy(
             for sub in subs:
                 fqdn = f"{sub}.{domain}"
                 sub_mail = f"mail.{fqdn}"
-                cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=(sub != "mail"))
+                # Sending-subdomain web A record. With a landing page the sub
+                # is grey-cloud (like the apex) so Caddy terminates TLS and
+                # serves the landing vhost - an orange-cloud sub 525s because
+                # Cloudflare proxies to an origin with no cert for that host.
+                # Without a landing page, keep the legacy proxied behaviour.
+                sub_proxied = (ctx.landing_page_url is None) and (sub != "mail")
+                cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=sub_proxied)
                 cf.upsert_record(zone_id, "A", sub_mail, vps_ip, proxied=False)
                 # AAAA on the non-proxied mail subdomain. Proxied A records
                 # don't need AAAA — Cloudflare's edge handles v6 transparently.
@@ -466,10 +472,11 @@ def run_deploy(
             state.mark_step_done("install_mta_sts")
         _append_log(sb, job_id, "MTA-STS + TLS-RPT live")
 
-        # Step 6.6: Landing page vhost on the apex (opt-in per client).
-        # When client_settings.landing_page_url is set, configure_dns created
-        # the apex A record unproxied, so Caddy can terminate TLS for
-        # https://<domain> and reverse-proxy the landing origin. Every
+        # Step 6.6: Landing page vhost on the apex + every sending subdomain
+        # (opt-in per client). When client_settings.landing_page_url is set,
+        # configure_dns created the apex AND each subdomain A record unproxied,
+        # so Caddy can terminate TLS for https://<domain> and
+        # https://<sub>.<domain> and reverse-proxy the landing origin. Every
         # non-asset path is rewritten to the landing path so the client's
         # full site is never browsable on a sending domain. Idempotent: the
         # managed Caddyfile block is replaced, never duplicated. No-op for
@@ -481,7 +488,10 @@ def run_deploy(
                 ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
                 ms.connect()
                 try:
-                    ms.install_landing_page(domain, ctx.landing_page_url)
+                    ms.install_landing_page(
+                        domain, ctx.landing_page_url,
+                        subdomains=state.get("subdomains") or [],
+                    )
                 finally:
                     ms.close()
             state.mark_step_done("setup_landing")

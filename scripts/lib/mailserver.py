@@ -74,19 +74,32 @@ LANDING_ASSET_PATHS = [
 ]
 
 
-def landing_vhost_block(domain: str, landing_url: str) -> str:
-    """Caddy vhost serving a landing page on the sending domain's apex.
+def landing_vhost_block(
+    domain: str,
+    landing_url: str,
+    subdomains: list[str] | None = None,
+) -> str:
+    """Caddy vhost serving a landing page on the sending domain's apex AND
+    every sending subdomain.
 
-    The apex A record must be unproxied (grey cloud) and point at this VPS
-    so Caddy can terminate TLS with its own Let's Encrypt cert - same
-    pattern as the mta-sts.<domain> vhost.
+    The apex and each subdomain A record must be unproxied (grey cloud) and
+    point at this VPS so Caddy can terminate TLS with its own Let's Encrypt
+    cert - same pattern as the mta-sts.<domain> vhost. A sending subdomain
+    left orange-clouded 525s: Cloudflare proxies to the origin over HTTPS
+    but Caddy has no cert for that hostname, so the origin handshake fails.
+
+    All hostnames (apex + <sub>.<domain> for each sub) go into one site
+    address so a single managed block serves the landing page for all of
+    them; Caddy provisions an LE cert per hostname via HTTP-01. The mail
+    hosts (mail.<sub>.<domain>) are deliberately NOT included - they carry
+    SMTP, not web, and nobody browses them.
 
     landing_url is the absolute https URL of the landing page on the
     origin, e.g. https://hello.10xmanagers.com/outreach. Asset paths are
     proxied through as-is; everything else is rewritten to the landing
     path first. header_up Host is set explicitly to the origin hostname
     (the origin routes on Host, and Caddy's https:// upstream already
-    gives us matching SNI).
+    gives us matching SNI) so every hostname resolves to the same page.
     """
     parsed = urlparse(landing_url)
     if parsed.scheme != "https" or not parsed.hostname:
@@ -96,8 +109,16 @@ def landing_vhost_block(domain: str, landing_url: str) -> str:
     origin_host = parsed.hostname
     landing_path = parsed.path or "/"
     asset_paths = " ".join(LANDING_ASSET_PATHS)
+    # Apex first, then each sending subdomain. De-duped, order-stable so the
+    # managed block is byte-identical on re-runs (idempotent Caddyfile).
+    hostnames = [domain]
+    for sub in subdomains or []:
+        fqdn = f"{sub}.{domain}"
+        if fqdn not in hostnames:
+            hostnames.append(fqdn)
+    site_address = ", ".join(hostnames)
     return f"""{LANDING_BLOCK_BEGIN}
-{domain} {{
+{site_address} {{
     @assets path {asset_paths}
     handle @assets {{
         reverse_proxy https://{origin_host} {{
@@ -661,10 +682,19 @@ MTASTS 200
                 f"Caddy did not start. Status: {status.strip()}\nLast logs:\n{logs}"
             )
 
-    def install_landing_page(self, domain: str, landing_url: str, bootstrap: bool = False) -> None:
-        """Add (or refresh) the apex landing-page vhost in /etc/caddy/Caddyfile
-        and reload Caddy so https://<domain> serves the configured landing
-        origin. See landing_vhost_block for the block contents.
+    def install_landing_page(
+        self,
+        domain: str,
+        landing_url: str,
+        bootstrap: bool = False,
+        subdomains: list[str] | None = None,
+    ) -> None:
+        """Add (or refresh) the landing-page vhost in /etc/caddy/Caddyfile and
+        reload Caddy so https://<domain> AND every sending subdomain serve the
+        configured landing origin. See landing_vhost_block for the block
+        contents. Pass subdomains (the shard's sending sub labels, e.g.
+        ["partner", "team"]) so each <sub>.<domain> gets its own cert + vhost;
+        their A records must be grey-cloud + pointed here (see caller).
 
         Idempotent: any previous managed landing block is stripped before
         the new one is appended, so re-runs never duplicate vhosts.
@@ -673,10 +703,11 @@ MTASTS 200
         install_mta_sts (the deploy pipeline runs that step first). Shards
         deployed before 2026-05-21 predate Caddy/MTA-STS entirely; for those,
         pass bootstrap=True to install Caddy and start from a minimal
-        Caddyfile containing only the landing vhost. The apex DNS A record
-        must be unproxied and pointing at this VPS before Caddy can complete
-        Let's Encrypt issuance for the apex (issuance retries in the
-        background, so vhost-then-DNS ordering is fine).
+        Caddyfile containing only the landing vhost. The apex and each
+        subdomain DNS A record must be unproxied and pointing at this VPS
+        before Caddy can complete Let's Encrypt issuance for that hostname
+        (issuance retries in the background, so vhost-then-DNS ordering is
+        fine).
         """
         rc, existing, _ = self.sudo("cat /etc/caddy/Caddyfile", check=False)
         if rc != 0 or not existing.strip():
@@ -695,7 +726,9 @@ MTASTS 200
             self.sudo("systemctl enable caddy")
 
         base = _strip_landing_block(existing)
-        caddyfile = base.rstrip("\n") + "\n\n" + landing_vhost_block(domain, landing_url)
+        caddyfile = base.rstrip("\n") + "\n\n" + landing_vhost_block(
+            domain, landing_url, subdomains=subdomains
+        )
 
         self.upload_text(caddyfile, "/tmp/Caddyfile.new")
         self.sudo("mv /tmp/Caddyfile.new /etc/caddy/Caddyfile")
