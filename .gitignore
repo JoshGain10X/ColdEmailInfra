@@ -8,3 +8,8 @@ shards/*_bison.csv
 shards/archived/
 *.log
 .DS_Store
+
+# OAuth client secrets (Google) — never commit
+gpt-poller/gpt_oauth_client.json
+*_oauth_client.json
+*.oauth.json
