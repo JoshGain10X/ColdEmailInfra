@@ -1909,42 +1909,45 @@ def run_placement_test(
         subject = _resolve_spintax(subject).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first)
         body = _resolve_spintax(body_template).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first).replace("{SENDER_LAST_NAME}", last).replace("{SENDER_EMAIL_SIGNATURE}", "").replace("{PHRASE}", phrase)
 
-        # 5. SSH the shard's mail VPS, upload a tiny smtplib drip script, exec
-        ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
-        ssh_user = (state.get("vps") or {}).get("ssh_user") or os.environ.get("SSH_USER", "admin")
-        ms = MailserverClient(vps_ip, ssh_key, user=ssh_user)
-        ms.connect()
-        try:
-            send_script = f'''#!/usr/bin/env python3
-import smtplib, ssl, time, json
-from email.message import EmailMessage
-ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
-SENDER={sender!r}; SENDER_NAME={(first + ' ' + last).strip()!r}; PASSWORD={SHARED_MAILBOX_PASSWORD!r}
-SEEDS={seeds!r}
-SUBJECT={subject!r}
-HTML_BODY={body!r}
-ok=err=0
-for rcpt in SEEDS:
-    msg=EmailMessage()
-    msg["From"]=f"{{SENDER_NAME}} <{{SENDER}}>"; msg["To"]=rcpt; msg["Subject"]=SUBJECT
-    msg.set_content("Plain-text fallback.")
-    msg.add_alternative(HTML_BODY, subtype="html")
-    try:
-        with smtplib.SMTP("localhost",587,timeout=30) as s:
-            s.ehlo(); s.starttls(context=ctx); s.ehlo()
-            s.login(SENDER, PASSWORD)
-            s.send_message(msg, from_addr=SENDER, to_addrs=[rcpt])
-        ok+=1
-    except Exception as e:
-        err+=1
-    time.sleep(4)
-print(json.dumps({{"ok": ok, "err": err}}))
-'''
-            ms.upload_text(send_script, "/tmp/eg_send.py")
-            rc, out, _se = ms.run("python3 /tmp/eg_send.py", check=False)
-            _append_log(sb, job_id, f"Drip-send result: rc={rc} out={out.strip()[:200]}", step=4)
-        finally:
-            ms.close()
+        # 5. Drip-send from THIS host straight to the shard's public submission
+        # port - the same external->public-IP:587 path Bison uses (verified to
+        # auth in ~0.1s). The previous approach SSHed onto the shard and connected
+        # to localhost:587, but same-host connections to the docker-published
+        # submission port hairpin and hang (25s timeout), so every placement send
+        # failed 0/8 even though real campaign mail flows fine. No SSH needed.
+        import smtplib as _smtplib
+        import ssl as _ssl
+        from email.message import EmailMessage as _EmailMessage
+        _ctx = _ssl.create_default_context()
+        _ctx.check_hostname = False
+        _ctx.verify_mode = _ssl.CERT_NONE
+        sender_name = (first + " " + last).strip()
+        ok = err = 0
+        last_err = None
+        for rcpt in seeds:
+            try:
+                msg = _EmailMessage()
+                msg["From"] = f"{sender_name} <{sender}>"
+                msg["To"] = rcpt
+                msg["Subject"] = subject
+                msg.set_content("Plain-text fallback.")
+                msg.add_alternative(body, subtype="html")
+                with _smtplib.SMTP(vps_ip, 587, timeout=30) as _s:
+                    _s.ehlo()
+                    _s.starttls(context=_ctx)
+                    _s.ehlo()
+                    _s.login(sender, SHARED_MAILBOX_PASSWORD)
+                    _s.send_message(msg, from_addr=sender, to_addrs=[rcpt])
+                ok += 1
+            except Exception as _e:  # noqa: BLE001 - capture so failures are visible
+                err += 1
+                last_err = f"{type(_e).__name__}: {str(_e)[:150]}"
+            time.sleep(4)
+        _append_log(
+            sb, job_id,
+            f"Drip-send: {ok} sent, {err} failed" + (f" (last error: {last_err})" if err else ""),
+            step=4,
+        )
 
         # 6. Persist the test_uuid + which campaign body was used
         sb.table("infra_jobs").update({
