@@ -1917,6 +1917,7 @@ def run_placement_test(
         # failed 0/8 even though real campaign mail flows fine. No SSH needed.
         import smtplib as _smtplib
         import ssl as _ssl
+        import time as _time
         from email.message import EmailMessage as _EmailMessage
         _ctx = _ssl.create_default_context()
         _ctx.check_hostname = False
@@ -1942,7 +1943,7 @@ def run_placement_test(
             except Exception as _e:  # noqa: BLE001 - capture so failures are visible
                 err += 1
                 last_err = f"{type(_e).__name__}: {str(_e)[:150]}"
-            time.sleep(4)
+            _time.sleep(4)
         _append_log(
             sb, job_id,
             f"Drip-send: {ok} sent, {err} failed" + (f" (last error: {last_err})" if err else ""),
