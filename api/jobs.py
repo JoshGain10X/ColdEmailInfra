@@ -1908,6 +1908,15 @@ def run_placement_test(
         # Resolve spintax + variables. Generic ICP-neutral substitutions.
         subject = _resolve_spintax(subject).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first)
         body = _resolve_spintax(body_template).replace("{FIRST_NAME}", "there").replace("{COMPANY}", "your company").replace("{SENDER_FIRST_NAME}", first).replace("{SENDER_LAST_NAME}", last).replace("{SENDER_EMAIL_SIGNATURE}", "").replace("{PHRASE}", phrase)
+        # EmailGuard associates each seed email to this test by matching the
+        # filter phrase in the body. The default body carries it in a hidden
+        # span, but real campaign bodies have no {PHRASE} token - so the replace
+        # above is a no-op for them and the phrase never reaches the seeds, which
+        # then sit on 'waiting_for_email' forever and the test never scores.
+        # Guarantee the phrase is present, using the same hidden-span pattern the
+        # default body uses (proven to score).
+        if phrase not in body:
+            body = body + f'\n<span style="color:#ffffff;font-size:1px">{phrase}</span>'
 
         # 5. Drip-send from THIS host straight to the shard's public submission
         # port - the same external->public-IP:587 path Bison uses (verified to
