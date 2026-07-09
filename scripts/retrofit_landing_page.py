@@ -205,6 +205,21 @@ def _retrofit_one(
     if subs:
         click.echo(f"  ✓ {len(subs)} subdomain A record(s) set to proxied=False")
 
+    # (b2) Restart Caddy now that every hostname is grey-cloud. The vhost
+    # install above reloaded Caddy while the subs were still Cloudflare-proxied,
+    # so their HTTP-01 challenges 404'd at the origin and Caddy burned its 3
+    # attempts. Modern 6-8 sub shards self-heal on backoff, but 20-sub legacy
+    # shards exhaust attempts before DNS propagates. A restart against correct
+    # DNS re-issues cleanly on the first try.
+    if subs:
+        ms = MailserverClient(vps_ip, ssh_key, user=_ssh_user(state))
+        ms.connect()
+        try:
+            ms.restart_caddy()
+        finally:
+            ms.close()
+        click.echo("  ✓ Caddy restarted for clean cert issuance (post-DNS-flip)")
+
     # (c) Best-effort removal of the legacy apex redirect rule. The rule is
     # unreachable anyway once the apex is grey-cloud, so a 403 here is fine.
     try:

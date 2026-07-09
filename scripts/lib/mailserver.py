@@ -749,6 +749,24 @@ MTASTS 200
                 f"Caddy did not reload cleanly. Status: {status.strip()}\nLast logs:\n{logs}"
             )
 
+    def restart_caddy(self) -> None:
+        """Restart Caddy so it re-attempts ACME issuance for any hostname it
+        could not obtain a cert for earlier (e.g. a subdomain whose A record
+        was still Cloudflare-proxied when the vhost first loaded - the HTTP-01
+        challenge then 404s at the origin and Caddy burns its 3 attempts).
+        Call this AFTER the DNS flip to grey-cloud so the retry sees correct
+        DNS. A plain reload respects existing per-host backoff; a restart
+        clears it and kicks off a fresh issuance loop immediately.
+        """
+        self.sudo("systemctl restart caddy")
+        time.sleep(3)
+        _, status, _ = self.sudo("systemctl is-active caddy", check=False)
+        if "active" not in status:
+            _, logs, _ = self.sudo("journalctl -u caddy --no-pager -n 30", check=False)
+            raise RuntimeError(
+                f"Caddy did not restart cleanly. Status: {status.strip()}\nLast logs:\n{logs}"
+            )
+
     def smtp_cert_names(self) -> list[str]:
         """Return the DNS names on the TLS cert Postfix presents on port 25.
 
