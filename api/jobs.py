@@ -335,8 +335,13 @@ def run_deploy(
             cf.upsert_record(zone_id, "A", domain, vps_ip,
                              proxied=(ctx.landing_page_url is None))
             cf.upsert_record(zone_id, "A", mail_host, vps_ip, proxied=False)
-            if vps_ip6:
-                cf.upsert_record(zone_id, "AAAA", mail_host, vps_ip6, proxied=False)
+            # NOTE: intentionally NO AAAA for mail hosts. docker-mailserver in
+            # Docker does not serve IMAP/SMTP over IPv6, and Webdock reports the
+            # /64 base address (…::) which nothing listens on. Advertising it
+            # makes IPv6-capable clients (Bison's IMAP poller, and IPv6 senders
+            # like Gmail/Microsoft) prefer a dead address and silently fail to
+            # connect — the cause of the fleet-wide reply-ingestion outage
+            # (Jul 2026). IPv4 A record only. See scripts/fix_mail_aaaa.py.
             cf.upsert_record(
                 zone_id, "TXT", f"_dmarc.{domain}",
                 f"v=DMARC1; p=quarantine; sp=quarantine; rua=mailto:{dmarc_rua}; adkim=r; aspf=r",
@@ -368,10 +373,9 @@ def run_deploy(
                 sub_proxied = (ctx.landing_page_url is None) and (sub != "mail")
                 cf.upsert_record(zone_id, "A", fqdn, vps_ip, proxied=sub_proxied)
                 cf.upsert_record(zone_id, "A", sub_mail, vps_ip, proxied=False)
-                # AAAA on the non-proxied mail subdomain. Proxied A records
-                # don't need AAAA — Cloudflare's edge handles v6 transparently.
-                if vps_ip6:
-                    cf.upsert_record(zone_id, "AAAA", sub_mail, vps_ip6, proxied=False)
+                # No AAAA on mail subdomains — see the mail_host note above.
+                # docker-mailserver doesn't serve IPv6; a dead AAAA breaks
+                # IMAP reply-ingestion and IPv6 inbound delivery.
                 cf.upsert_record(zone_id, "MX", fqdn, sub_mail, priority=10)
                 cf.upsert_record(zone_id, "TXT", fqdn, spf_record)
                 cf.upsert_record(

@@ -57,11 +57,26 @@ class WebdockClient:
         '2a0f:0f01:0207:573::0'. Filter out the literal placeholder
         '::0' which sometimes shows up before the v6 stack is fully
         assigned during provisioning.
+
+        Also reject /64-base addresses whose host portion is all-zero
+        (e.g. '2a0f:f01:208:5bd::'). Webdock reports the network base,
+        which nothing binds to — advertising it as an AAAA points clients
+        at a dead address (see api/jobs.py mail_host note / Jul 2026 outage).
         """
+        import ipaddress
+        placeholders = {"::0", "::", "0:0:0:0:0:0:0:0"}
         for key in ("ipv6", "ipv6Address", "mainIpv6"):
             v = raw.get(key)
-            if isinstance(v, str) and v and v not in ("::0", "::", "0:0:0:0:0:0:0:0"):
-                return v
+            if not (isinstance(v, str) and v) or v in placeholders:
+                continue
+            try:
+                addr = ipaddress.IPv6Address(v.split("/")[0])
+            except ValueError:
+                continue
+            # host portion of the /64 all-zero -> network base, not a real host
+            if (int(addr) & ((1 << 64) - 1)) == 0:
+                continue
+            return v
         return None
 
     @staticmethod
