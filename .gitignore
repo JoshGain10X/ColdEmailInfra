@@ -13,3 +13,4 @@ shards/archived/
 gpt-poller/gpt_oauth_client.json
 *_oauth_client.json
 *.oauth.json
+.n8n_key
