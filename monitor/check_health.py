@@ -114,27 +114,24 @@ def layer2_ingestion_stall() -> list[dict]:
         return []
     shards = active_shards()
     ws_list = bison("/api/workspaces").get("data", [])
-    ws_id = {w["name"]: w["id"] for w in ws_list}
-    # group shards by workspace so we switch once per workspace
-    by_ws: dict[str, list[str]] = {}
-    for s in shards:
-        by_ws.setdefault(s.get("bison_workspace") or "", []).append(s["domain"])
-
+    # Match each live shard to its senders by walking EVERY Bison workspace and
+    # matching on mail host - NOT on the infra_shards.bison_workspace label,
+    # which is stale/mismatched for some shards. This keeps coverage fleet-wide
+    # (10X + ReachOS + Scouted + any client) regardless of how shards are labelled.
+    remaining = {s["domain"]: s for s in shards}
     stalled = []
-    for ws_name, domains in by_ws.items():
-        wid = ws_id.get(ws_name)
-        if not wid:
-            log(f"Layer 2: workspace '{ws_name}' not found via superadmin; skipping {len(domains)} shard(s)")
-            continue
-        bison("/api/workspaces/switch-workspace", "POST", {"team_id": wid})
-        for domain in domains:
+    for w in ws_list:
+        if not remaining:
+            break
+        bison("/api/workspaces/switch-workspace", "POST", {"team_id": w["id"]})
+        for domain in list(remaining):
             mail_host = f"mail.{domain}"
-            res = bison(f"/api/sender-emails?search={domain}&per_page=25")
+            res = bison(f"/api/sender-emails?search={domain}&per_page=100")
             senders = [s for s in (res.get("data") or [])
                        if s.get("type") == "custom" and s.get("imap_server") == mail_host
                        and (s.get("emails_sent_count") or 0) >= MIN_SENT]
             if not senders:
-                continue  # not a live sending shard (or too new to judge)
+                continue  # this shard's senders aren't in this workspace
             freshest = None
             for s in senders[:SAMPLE_PER_SHARD]:
                 rep = bison(f"/api/sender-emails/{s['id']}/replies?per_page=1")
@@ -142,16 +139,20 @@ def layer2_ingestion_stall() -> list[dict]:
                 if data:
                     age = _age_hours(data[0]["created_at"])
                     freshest = age if freshest is None else min(freshest, age)
+            del remaining[domain]  # matched - don't search further workspaces
             if freshest is None or freshest > STALL_HOURS:
                 stalled.append({
-                    "shard": domain, "workspace": ws_name,
+                    "shard": domain, "workspace": w["name"],
                     "senders_checked": len(senders[:SAMPLE_PER_SHARD]),
                     "hours_since_last_ingest": round(freshest, 1) if freshest is not None else None,
                 })
-                log(f"Layer 2 STALL: {domain} ({ws_name}) - "
+                log(f"Layer 2 STALL: {domain} ({w['name']}) - "
                     f"{'no inbound ever' if freshest is None else str(round(freshest,1))+'h since last inbound'}")
+    if remaining:
+        log(f"Layer 2: {len(remaining)} live shard(s) had no sender with >={MIN_SENT} sends in any "
+            f"workspace - not judged (likely new/low-volume): {list(remaining)}")
     if not stalled:
-        log("Layer 2 OK: all active shards ingesting within threshold")
+        log("Layer 2 OK: all matched shards ingesting within threshold")
     return stalled
 
 
