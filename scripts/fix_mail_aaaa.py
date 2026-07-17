@@ -19,12 +19,15 @@ Usage:
 """
 import argparse, json, os, sys, urllib.request, urllib.parse, urllib.error
 
-TOKEN = None
-for _line in open(os.path.join(os.path.dirname(__file__), "..", ".env")):
-    if _line.startswith("CLOUDFLARE_API_TOKEN="):
-        TOKEN = _line.split("=", 1)[1].strip()
+TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
 if not TOKEN:
-    sys.exit("no CLOUDFLARE_API_TOKEN in .env")
+    _envf = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(_envf):
+        for _line in open(_envf):
+            if _line.startswith("CLOUDFLARE_API_TOKEN="):
+                TOKEN = _line.split("=", 1)[1].strip()
+if not TOKEN:
+    sys.exit("no CLOUDFLARE_API_TOKEN (env var or .env)")
 
 BASE = "https://api.cloudflare.com/client/v4"
 

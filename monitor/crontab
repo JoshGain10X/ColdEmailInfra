@@ -1,0 +1,5 @@
+# Inbound-ingestion health monitor. Every 6h:
+#   - Layer 1: Cloudflare scan for dead mail.* AAAA (/64-base) records
+#   - Layer 2: per-shard Bison ingestion-freshness (stall detection)
+# Alerts to N8N_ALERT_WEBHOOK_URL (-> MS Teams). Detection latency <= 6h.
+0 */6 * * * /usr/local/bin/python /app/monitor/check_health.py
