@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import secrets
+import shlex
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -34,6 +35,18 @@ POSTFIX_RATE_CAP_SETTINGS = {
     "default_destination_rate_delay": "1s",
     "smtp_destination_concurrency_limit": "5",
 }
+
+# Memory hardening (see project-shard-memory-hardening). The ~2GB shard VMs
+# ship with no swap, and Bison's persistent IMAP reply-polling connections can
+# hold ~1.4GB, so a memory spike OOM-kills the biggest non-mail process (Caddy)
+# - a silent multi-day web/MTA-STS outage. A swapfile backstop plus a Caddy
+# cgroup cap + auto-restart keeps the box alive and self-healing. Cost-neutral
+# (no box upgrade). NOTE: this does NOT include imap-hibernate - that lever
+# does not trigger in our DMS/Dovecot build (validated 2026-07) and is deferred.
+SWAP_SIZE_MB = 2048
+SWAPPINESS = 10
+CADDY_MEMORY_HIGH = "300M"
+CADDY_MEMORY_MAX = "450M"
 
 
 def postfix_main_cf_override() -> str:
@@ -254,6 +267,39 @@ class MailserverClient:
                 value = out.split("=", 1)[1].strip()
             result[key] = value
         return result
+
+    def apply_memory_hardening(self) -> None:
+        """Add a swapfile backstop and cap Caddy's memory, idempotently.
+
+        Two independent protections against the OOM that silently kills Caddy
+        on the memory-tight, no-swap shard VMs (see project-shard-memory-hardening):
+          (a) a SWAP_SIZE_MB swapfile with a low vm.swappiness (safety net, not
+              constant swapping), persisted in /etc/fstab so it survives reboot;
+          (b) a systemd drop-in capping Caddy (MemoryHigh/MemoryMax) with
+              Restart=on-failure, applied live via `systemctl set-property` so a
+              single OOM can never take the box down or leave Caddy dead for days.
+
+        Re-running is a no-op (swap skipped if present, drop-in rewritten
+        identically). Safe to call on every deploy and as a retrofit.
+        """
+        script = (
+            f"if ! swapon --show 2>/dev/null | grep -q /swapfile; then "
+            f"fallocate -l {SWAP_SIZE_MB}M /swapfile 2>/dev/null || "
+            f"dd if=/dev/zero of=/swapfile bs=1M count={SWAP_SIZE_MB} status=none; "
+            f"chmod 600 /swapfile; mkswap /swapfile >/dev/null 2>&1; "
+            f"if swapon /swapfile 2>/dev/null; then "
+            f"grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; "
+            f"else rm -f /swapfile; fi; fi; "
+            f"sysctl -w vm.swappiness={SWAPPINESS} >/dev/null 2>&1; "
+            f"grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness={SWAPPINESS}' >> /etc/sysctl.conf; "
+            f"mkdir -p /etc/systemd/system/caddy.service.d; "
+            f"printf '[Service]\\nMemoryHigh={CADDY_MEMORY_HIGH}\\nMemoryMax={CADDY_MEMORY_MAX}\\n"
+            f"Restart=on-failure\\nRestartSec=10s\\n' > /etc/systemd/system/caddy.service.d/override.conf; "
+            f"systemctl daemon-reload; "
+            f"systemctl set-property caddy MemoryHigh={CADDY_MEMORY_HIGH} MemoryMax={CADDY_MEMORY_MAX} 2>/dev/null || true; "
+            f"systemctl reset-failed caddy 2>/dev/null || true"
+        )
+        self.sudo(f"bash -c {shlex.quote(script)}")
 
     def install_warmup_sieve(self, restart: bool = True) -> None:
         """Install the global Sieve filter that routes Instantly warmup peer

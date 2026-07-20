@@ -501,6 +501,22 @@ def run_deploy(
             state.mark_step_done("setup_landing")
         _append_log(sb, job_id, "Landing page step complete", step=8)
 
+        # Step 6.7: Memory hardening (swap + Caddy cgroup cap + auto-restart).
+        # Runs after Caddy is installed (MTA-STS/landing steps). The ~2GB
+        # no-swap boxes OOM-kill Caddy under Bison's IMAP reply-polling load;
+        # this backstops it cost-neutrally. Idempotent. See
+        # project-shard-memory-hardening / MailserverClient.apply_memory_hardening.
+        if not state.is_step_done("memory_hardening"):
+            _append_log(sb, job_id, "Applying memory hardening (swap + Caddy cap)")
+            ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
+            ms.connect()
+            try:
+                ms.apply_memory_hardening()
+            finally:
+                ms.close()
+            state.mark_step_done("memory_hardening")
+        _append_log(sb, job_id, "Memory hardening applied")
+
         # Step 7: Setup DKIM
         if not state.is_step_done("setup_dkim"):
             _append_log(sb, job_id, "Generating DKIM keys")
