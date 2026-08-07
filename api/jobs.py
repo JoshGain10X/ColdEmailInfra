@@ -770,11 +770,24 @@ def run_destroy(job_id: str, client_id: str, domain: str) -> None:
 def _teardown_offboard_shard(sb: Client, ctx: ClientContext, domain: str, job_id: str) -> None:
     """Remove a shard's Instantly warmup seats and Bison senders.
 
-    Shared teardown leg used by run_destroy. Reads the shard's mailbox emails and
-    Bison sender ids from instantly_warmup_state (populated at load-to-bison), so
-    it works even when the shard's CSV has been archived. Idempotent + best-effort.
+    Shared teardown leg used by run_destroy. Idempotent + best-effort.
+
+    Sender discovery is DELIBERATELY two-source. instantly_warmup_state (populated
+    at load-to-bison) supplies the mailbox emails for the Instantly leg and the
+    known Bison sender ids; Bison itself is then swept for anything still present
+    under the root. The sweep is not redundant - it is the authoritative half:
+    this function used to derive Bison ids ONLY from the warmup table and return
+    early when that table had no rows, so a shard whose warmup rows were missing
+    or already purged off-boarded nothing and said so only in a log line. That is
+    how ~500 mailboxes across five destroyed roots stayed in Bison with dead MX
+    through 2026-06/07, including 100 on a root with zero warmup rows.
     """
-    from lib.teardown import registrable_root_domain, remove_bison_senders, remove_instantly_seats
+    from lib.teardown import (
+        bison_sender_ids_under_root,
+        registrable_root_domain,
+        remove_bison_senders,
+        remove_instantly_seats,
+    )
 
     root = registrable_root_domain(domain)
     rows = (
@@ -785,18 +798,21 @@ def _teardown_offboard_shard(sb: Client, ctx: ClientContext, domain: str, job_id
         .data
     ) or []
     if not rows:
-        _append_log(sb, job_id, f"No instantly_warmup_state rows for {domain}; nothing to off-board")
-        return
+        # NOT a reason to stop: the Bison sweep below does not depend on these rows.
+        _append_log(sb, job_id,
+            f"No instantly_warmup_state rows for {domain}; "
+            "skipping Instantly leg and sweeping Bison directly")
 
     emails = [r["email"] for r in rows if r.get("email")]
     sender_ids = [r["bison_sender_email_id"] for r in rows if r.get("bison_sender_email_id")]
 
     # Instantly seats (INSTANTLY_API_KEY from env; no per-client scoping needed).
-    inst = remove_instantly_seats(emails)
-    _append_log(sb, job_id,
-        f"Instantly: deleted {inst['deleted']}, already-gone {inst['already_gone']} "
-        f"of {inst['requested']}"
-        + (f"; {len(inst['errors'])} errors" if inst["errors"] else ""))
+    if emails:
+        inst = remove_instantly_seats(emails)
+        _append_log(sb, job_id,
+            f"Instantly: deleted {inst['deleted']}, already-gone {inst['already_gone']} "
+            f"of {inst['requested']}"
+            + (f"; {len(inst['errors'])} errors" if inst["errors"] else ""))
 
     # Bison senders: use the shard's own workspace token. Match the workspace_id
     # on the warmup rows to one of the client's configured Bison workspaces.
@@ -812,7 +828,15 @@ def _teardown_offboard_shard(sb: Client, ctx: ClientContext, domain: str, job_id
         _append_log(sb, job_id,
             "No Bison workspace resolved for shard; leaving senders for reconcile.")
     else:
-        bres = remove_bison_senders(ws._api_key, ws.base_url, sender_ids)
+        # Union the table-derived ids with everything Bison still reports under the
+        # root, so a stale/missing warmup row can no longer hide a live sender.
+        swept = bison_sender_ids_under_root(ws._api_key, ws.base_url, root)
+        extra = [sid for sid in swept if sid not in set(sender_ids)]
+        if extra:
+            _append_log(sb, job_id,
+                f"Bison sweep found {len(extra)} sender(s) under {root} absent from "
+                "instantly_warmup_state; including them in the off-board")
+        bres = remove_bison_senders(ws._api_key, ws.base_url, list(sender_ids) + extra)
         _append_log(sb, job_id,
             f"Bison: deleted {bres['deleted']}, already-gone {bres['already_gone']} "
             f"of {bres['requested']}"

@@ -307,8 +307,20 @@ def reconcile_root_domain(sb, warmup_rows: list[dict], fix: bool) -> dict:
 
 
 # Non-shard infra servers that must never be flagged as orphans (control plane).
-INFRA_SERVER_IPS = {"193.180.211.74", "193.180.211.174"}  # infraapi1, goworkers
-INFRA_SERVER_SLUG_HINTS = ("infraapi", "goworker")
+#
+# These boxes have no infra_shards row by design, so the "running server with NO
+# shard row" branch below would otherwise report them as orphan-billed VPSes -
+# and the remediation text it prints is "delete slug <x> ... SPEND/IRREVERSIBLE".
+# Acting on that for a control-plane box takes down the platform: reachosapi1
+# runs the ReachOS API, MCP server, mail engine and the reconcile/teardown crons.
+# Keep this list in step with every non-shard VPS in the Webdock account.
+INFRA_SERVER_IPS = {
+    "193.180.211.74",   # infraapi1     - ColdEmailInfra control plane
+    "193.180.211.174",  # goworkers     - CC push workers
+    "92.113.150.181",   # reachosapi1   - ReachOS API/MCP/mailengine/crons
+    "45.148.28.54",     # reachosprobe  - ReachOS probe box
+}
+INFRA_SERVER_SLUG_HINTS = ("infraapi", "goworker", "reachos")
 
 
 def reconcile_orphan_vps(sb, shards: list[dict], client_id: str | None, approvals: list[str]) -> dict:

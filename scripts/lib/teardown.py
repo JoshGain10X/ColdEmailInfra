@@ -193,6 +193,66 @@ def remove_instantly_seats(emails: Iterable[str]) -> dict[str, Any]:
 # DELETE /api/sender-emails/{id}; we call it directly with the workspace token.
 
 
+def bison_sender_ids_under_root(bison_token: str, base_url: str, root: str) -> list[int]:
+    """Every Bison sender id in the workspace whose email domain rolls up to `root`.
+
+    Asks BISON what is still in Bison, rather than deriving the list from our own
+    tables. That distinction matters: the previous teardown discovered senders
+    only from `instantly_warmup_state`, so a root with no warmup rows off-boarded
+    NOTHING and failed silently. That is exactly how mail10xmanagers.com kept 100
+    live sender records after its VPS was destroyed in 2026-06.
+
+    Matching is exact-or-dot-anchored (`root` itself, or any subdomain of it), so
+    a look-alike registrable domain that merely ends with the same text
+    (notmail10xmanagers.com vs mail10xmanagers.com) is never swallowed.
+
+    Best-effort: on any API failure it returns what it has rather than raising, so
+    a Bison outage degrades the sweep instead of wedging the whole teardown. The
+    caller treats this as an ADDITIONAL source of ids, never the only one.
+    """
+    root = (root or "").strip().strip(".").lower()
+    if not root:
+        return []
+    headers = {
+        "Authorization": f"Bearer {bison_token.strip()}",
+        "Accept": "application/json",
+        "User-Agent": "curl/8.6.0",
+        "Connection": "close",
+    }
+    base = base_url.rstrip("/")
+    out: list[int] = []
+    page = 1
+    last_page = 1
+    while page <= last_page:
+        try:
+            resp = requests.get(
+                f"{base}/api/sender-emails?page={page}", headers=headers, timeout=60
+            )
+        except Exception:  # noqa: BLE001 - degrade, never wedge the teardown
+            break
+        if resp.status_code == 422:
+            # Bison's signal that we paged past the last page - a clean end-of-walk.
+            break
+        if resp.status_code >= 400:
+            break
+        try:
+            body = resp.json()
+        except ValueError:
+            break
+        for row in body.get("data") or []:
+            email = (row.get("email") or "").strip().lower()
+            dom = email.split("@", 1)[1] if "@" in email else ""
+            if dom == root or dom.endswith("." + root):
+                sid = row.get("id")
+                if sid is not None:
+                    out.append(int(sid))
+        meta = body.get("meta") or {}
+        if meta.get("last_page"):
+            last_page = int(meta["last_page"])
+        page += 1
+    return out
+
+
 def remove_bison_senders(bison_token: str, base_url: str, sender_ids: Iterable[int]) -> dict[str, Any]:
     """Delete Bison sender-email records by id in the given workspace.
 
