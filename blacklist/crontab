@@ -1,5 +1,0 @@
-# Daily blacklist + SURBL scan across the active fleet.
-# Fires one EmailGuard DNSBL check per shard VPS IP + one per shard root domain,
-# plus one SURBL domain check per shard. Both unmetered.
-# Results land in blacklist_checks + surbl_checks; the CRM reads via shard_health_recommendations.
-0 6 * * * /usr/local/bin/python /app/blacklist/poll.py
