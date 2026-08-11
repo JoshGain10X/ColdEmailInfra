@@ -46,6 +46,48 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Protected domains — NEVER provisionable as cold-email shards
+# ---------------------------------------------------------------------------
+
+# Deploying a shard on a domain REWRITES ITS MX to the shard mailserver. On a domain that
+# carries real company mail that silently destroys all inbound email, and the breakage is
+# only obvious once someone notices they stopped receiving mail.
+#
+# These domains carry (or are about to carry) corporate mail and must never be claimed by
+# the provisioning system, however they got requested. Matching covers subdomains too, so
+# mail.10xcommunities.com is refused along with the apex.
+#
+# 10xleadershipdevelopment.uk — 2026-08-11: the Claude Team org domain for the ABDR BDR
+#   seats. Verified clean before use: not in cold_email_domains or infra_domains, never
+#   had a shard, never sent an email, DNS is bare Cloudflare NS. It is NOT in the sending
+#   registry, so nothing would route it here by itself - this guard exists to stop someone
+#   adding it by hand later, once it carries the BDRs' mail and the damage is invisible.
+#
+# NOTE 10xcommunities.com / .co were briefly listed here on 2026-08-11 when they were the
+# intended org domain. That plan changed the same day, so they are deliberately NOT
+# protected - they remain registered 10X cold-email domains and must stay available.
+PROTECTED_DOMAINS = frozenset({
+    "10xleadershipdevelopment.uk",
+    "reachos.co",        # live Microsoft 365 MX for ReachOS company mail
+    "10xmanagers.com",   # live 10X Managers company mail
+})
+
+
+def _assert_not_protected(domain: str) -> None:
+    """Refuse any provisioning action on a protected domain (or a subdomain of one)."""
+    d = (domain or "").strip().lower().rstrip(".")
+    for p in PROTECTED_DOMAINS:
+        if d == p or d.endswith("." + p):
+            raise HTTPException(
+                403,
+                f"Domain {domain!r} is PROTECTED and cannot be used as a cold-email shard. "
+                f"It carries corporate mail; deploying would rewrite its MX and break all "
+                f"inbound email. Remove it from PROTECTED_DOMAINS in api/main.py only if you "
+                f"are certain the domain no longer carries mail.",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Supabase + client resolution helpers
 # ---------------------------------------------------------------------------
 
@@ -220,6 +262,7 @@ def deploy(req: DeployRequest, bg: BackgroundTasks, _: str = Depends(verify_api_
     client_slug is required. product_id/region/image_id/ssl_type are
     optional; if omitted they fall back to client_settings values.
     """
+    _assert_not_protected(req.domain)
     client_id = _resolve_client_id(req.client_slug)
     provider = req.provider
 
@@ -553,6 +596,7 @@ def check_domain(req: DomainCheckRequest, _: str = Depends(verify_api_key)):
 @app.post("/api/domains/register")
 def register_domain(req: RegisterDomainRequest, bg: BackgroundTasks, _: str = Depends(verify_api_key)):
     """Register a domain via the client's Cloudflare Registrar account."""
+    _assert_not_protected(req.domain)
     client_id = _resolve_client_id(req.client_slug)
     job_id = _create_job("domain_register", client_id, req.domain, total_steps=4, created_by=req.created_by)
     bg.add_task(run_domain_register, job_id, client_id, req.domain)

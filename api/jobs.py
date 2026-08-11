@@ -50,6 +50,28 @@ import dns.reversename
 # Supabase helpers
 # ---------------------------------------------------------------------------
 
+# Domains that must never be turned into cold-email shards. Duplicated from api/main.py
+# deliberately: main.py guards the HTTP boundary, this guards direct imports of run_deploy /
+# run_domain_register from scripts and one-off reconciliation tooling, which is how most
+# provisioning actually gets triggered. A shard deploy rewrites the domain's MX, so on a
+# domain carrying corporate mail this is unrecoverable-by-accident.
+PROTECTED_DOMAINS = frozenset({
+    "10xleadershipdevelopment.uk",
+    "reachos.co",
+    "10xmanagers.com",
+})
+
+
+def _assert_not_protected(domain: str) -> None:
+    d = (domain or "").strip().lower().rstrip(".")
+    for p in PROTECTED_DOMAINS:
+        if d == p or d.endswith("." + p):
+            raise RuntimeError(
+                f"REFUSING to provision {domain!r}: protected domain carrying corporate mail. "
+                f"A shard deploy would rewrite its MX and break all inbound email."
+            )
+
+
 def _supabase() -> Client:
     url = os.environ["SUPABASE_URL"]
     key = os.environ["SUPABASE_SERVICE_KEY"]
@@ -178,6 +200,7 @@ def run_deploy(
     rather than process env vars. Per-call request overrides still win
     (passed-in product_id/region/image_id/ssl_type override client defaults).
     """
+    _assert_not_protected(domain)
     load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
@@ -1712,6 +1735,7 @@ def run_domain_register(job_id: str, client_id: str, domain: str) -> None:
     zone lands on the right account. The domain is attributed to the
     given client in infra_domains.
     """
+    _assert_not_protected(domain)
     load_dotenv()  # process env wins (set via docker --env-file)
     sb = _supabase()
     _update_job(sb, job_id, status="running")
