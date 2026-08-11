@@ -91,6 +91,25 @@ def _complete_job(sb: Client, job_id: str, error: str | None = None) -> None:
     _update_job(sb, job_id, **update)
 
 
+# Bison workspace -> warmup_filter_phrase. Instantly's warmup_custom_ftag must
+# equal the target workspace's phrase or Bison treats peer warmup mail as real
+# replies. Bison DROPPED this field from its API on/around 2026-08-11, so it can
+# no longer be read at load time and must be persisted here. Verified empirically
+# against a shard that has always lived in the workspace (compare the Instantly
+# warmup_custom_ftag of a healthy shard, not the docs).
+#
+# Adding a workspace: fetch a known-good shard's warmup_custom_ftag from Instantly
+# and add it here. Do NOT guess, and never fall back to "sointerested".
+WARMUP_FILTER_PHRASES: dict[str, str] = {
+    "2": "osxuxcl1",   # 10X B2B Prospects L&D & HR
+    "3": "hakqhgbw",   # ReachOS
+    "5": "rbcyygg4",   # 10X C-Suite (retired 2026-08-11)
+    "6": "eolgl9ik",   # 10X B2C Manager Prospects (retired 2026-08-11)
+    "8": "hs43naxs",   # Scouted - Candidates
+    "9": "adpetzlv",   # Scouted - Employers
+}
+
+
 def _upsert_shard(sb: Client, domain: str, **fields: Any) -> None:
     """Insert or update the infra_shards row for (client_id, domain).
 
@@ -1251,10 +1270,23 @@ def run_load_to_bison(
         formula = ctx.signature_for_workspace(target_ws.id)
 
         # Per-workspace Bison warmup_filter_phrase. Instantly's warmup_custom_ftag
-        # must equal this so Bison's IMAP poller excludes warmup mail from reply
-        # stats. Falls back to None if we can't read it - the create payload
-        # then uses the wrapper's default and we accept a small stats-pollution
-        # window until the warmup-poller / a manual rekey corrects it.
+        # must equal this EXACTLY so Bison's IMAP poller recognises peer warmup
+        # mail and excludes it from reply stats.
+        #
+        # There is NO safe fallback. The wrapper's legacy default ("sointerested")
+        # is a universal string Bison does not recognise at all - warmup peer mail
+        # then lands in the reply stream and floods the Teams triage channel. This
+        # code used to shrug that off as "a small stats-pollution window"; there is
+        # no poller that corrects it, so it is permanent until someone rekeys 100
+        # Instantly accounts by hand.
+        #
+        # As of 2026-08-11 Bison NO LONGER RETURNS warmup_filter_phrase from
+        # get_workspaces() (nor switch-workspace) - the field was dropped from the
+        # API. That turned the silent fallback into a guaranteed leak on every new
+        # load: try10xmanagers.com shipped with "sointerested" and started leaking
+        # within the hour. So: try the API first (in case they restore it), then a
+        # persisted per-workspace map, and RAISE if neither yields a phrase rather
+        # than loading 100 mailboxes with a tag known not to work.
         ws_warmup_phrase: str | None = None
         try:
             ws_list = bison.get_workspaces() or []
@@ -1264,6 +1296,23 @@ def run_load_to_bison(
                     break
         except Exception:
             pass
+
+        if not ws_warmup_phrase:
+            ws_warmup_phrase = WARMUP_FILTER_PHRASES.get(str(target_ws.workspace_id))
+            if ws_warmup_phrase:
+                _append_log(sb, job_id,
+                    f"Bison did not return warmup_filter_phrase for workspace "
+                    f"{target_ws.workspace_id}; using the persisted phrase")
+
+        if not ws_warmup_phrase:
+            raise RuntimeError(
+                f"No warmup_filter_phrase for Bison workspace {target_ws.workspace_id} "
+                f"({ws_name}). Bison no longer exposes it via the API and there is no "
+                f"entry in WARMUP_FILTER_PHRASES. Loading would tag every Instantly "
+                f"account with the legacy 'sointerested' string, which Bison does not "
+                f"recognise - warmup mail would be counted as real replies and leak "
+                f"into inbox triage. Add the workspace's phrase and re-run."
+            )
 
         _append_log(sb, job_id, f"Target workspace: {ws_name} (client: {ctx.slug})", step=2)
 
