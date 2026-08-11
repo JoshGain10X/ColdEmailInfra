@@ -263,6 +263,34 @@ def run_deploy(
                 instance_id = None
             else:
                 instance_id = vps_state.get("id")
+
+            # A state-recorded instance is a CLAIM, not a fact - verify it still
+            # exists before building on it. Teardown archives the state file at
+            # step 4, so any destroy that fails earlier (DNS 403, provider error)
+            # leaves the file behind pointing at a VPS that is now gone; the legacy
+            # destroy_shard.py CLI and manual interventions can do the same. The
+            # old code trusted the recorded id outright, so a redeploy skipped
+            # provisioning entirely and drove the whole build at a dead slug -
+            # surfacing minutes later as a bare "Authentication failed" at the
+            # mailserver step, pointing nowhere near the real cause. Observed on
+            # the10xmanagers.com (2026-08-07), whose state still held a VPS
+            # destroyed on 2026-06-16. A pendingDeletion server counts as gone: it
+            # is revoking at month-end and must never be built on.
+            if instance_id:
+                try:
+                    current = vps_client.get_instance(instance_id)
+                except Exception as exc:  # noqa: BLE001 - provider 404 or transport
+                    _append_log(sb, job_id,
+                        f"Recorded VPS {instance_id} not retrievable ({str(exc)[:120]}); "
+                        "discarding stale state and provisioning fresh")
+                    current = None
+                if current is None or current.get("pendingDeletion"):
+                    if current is not None:
+                        _append_log(sb, job_id,
+                            f"Recorded VPS {instance_id} is pendingDeletion; provisioning fresh")
+                    instance_id = None
+                    state.set("vps", {})
+
             if not instance_id:
                 existing = vps_client.find_instance_by_display_name(display_name)
                 if existing:

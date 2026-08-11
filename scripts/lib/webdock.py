@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import os
 import re
 import secrets
@@ -14,6 +15,53 @@ from typing import Any
 # and `webdock.exceptions` works on every 1.0.x release.
 from webdock.exceptions import WebdockException
 from webdock.webdock import Webdock as _WebdockSDK
+
+
+def _patch_sdk_error_detail() -> None:
+    """Make WebdockException carry Webdock's actual error message.
+
+    The vendored SDK raises `WebdockException('{status} Error: {reason}')` built
+    from `res.reason` - the generic HTTP phrase - and DISCARDS `res.text`, which
+    is exactly where Webdock puts the useful part:
+
+        {"id":0,"message":"Selected profile is not valid."}
+
+    So a real, specific failure reaches us as a bare `400 Error: Bad Request`.
+    On 2026-08-07 that turned a one-line diagnosis into an hour of guesswork:
+    provisioning 400s were assumed to be a concurrency limit, then a slug
+    collision, then an account cap, before the token was pulled from Vault and
+    the endpoint called by hand to read the body.
+
+    Patched once at import, idempotently, so every caller (deploy, destroy,
+    reconcile, the CLI) gets the detail without touching the vendored package.
+    Success responses are delegated untouched to the original implementation.
+    """
+    orig = _WebdockSDK.send_response
+    if getattr(orig, "_detail_patched", False):
+        return
+
+    def send_response(self, res, json=True):  # noqa: ANN001 - mirrors SDK signature
+        if res.status_code in (200, 201, 202, 418):
+            return orig(self, res, json)
+        detail = ""
+        try:
+            body = (res.text or "").strip()
+            if body:
+                try:
+                    parsed = _json.loads(body)
+                    msg = parsed.get("message") if isinstance(parsed, dict) else None
+                    detail = f" - {msg}" if msg else f" - {body[:300]}"
+                except ValueError:
+                    detail = f" - {body[:300]}"
+        except Exception:  # noqa: BLE001 - never let diagnostics break the raise
+            detail = ""
+        raise WebdockException(f"{res.status_code} Error: {res.reason}{detail}")
+
+    send_response._detail_patched = True  # type: ignore[attr-defined]
+    _WebdockSDK.send_response = send_response  # type: ignore[method-assign]
+
+
+_patch_sdk_error_detail()
 
 
 class WebdockClient:
