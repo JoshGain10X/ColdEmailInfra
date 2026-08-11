@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
@@ -97,12 +98,53 @@ class WebdockClient:
     # SSH keys (Webdock: account/publicKeys)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _key_material(key: dict) -> str:
+        """The public-key material from a Webdock key object.
+
+        Webdock returns the field as `key`; earlier code read `publicKey`, which
+        is ALWAYS absent, so the material comparison below silently never matched.
+        Both names are probed so a future API rename cannot re-break this quietly.
+        Only the type+base64 are compared - the trailing comment is cosmetic and
+        differs between machines that hold the same key.
+        """
+        raw = key.get("key") or key.get("publicKey") or ""
+        return " ".join(raw.split()[:2])
+
     def find_or_create_ssh_key(self, name: str, public_key: str) -> int:
-        public_key_stripped = public_key.strip()
+        """Return the Webdock key id whose MATERIAL is `public_key`, creating it if absent.
+
+        Identity is the key MATERIAL, never the name. The previous version returned
+        the first key whose NAME matched, which provisioned servers we could not log
+        into: redeploying a domain that had been deployed before found its old
+        `coldemail-<domain>` key, still holding a RETIRED public key, and handed that
+        to Webdock. The server came up healthy with an authorized_keys we no longer
+        had the private half of, and the deploy died at the mailserver step with a
+        bare "Authentication failed" several minutes later. It cost two shards on
+        2026-08-07 and is invisible until you diff the key material by hand.
+
+        When a key of the same name exists but holds DIFFERENT material it is stale;
+        we leave it alone (running servers may still reference it) and create ours
+        under a name suffixed with a short digest of the material. That suffix is
+        deterministic, so re-running finds the same key instead of piling up new ones.
+        """
+        wanted = " ".join(public_key.split()[:2])
         existing = self._unwrap(self._sdk.get_pubkeys()) or []
+
+        # 1. Correct identity: same key material, whatever it is called.
         for key in existing:
-            if key.get("name") == name or key.get("publicKey", "").strip() == public_key_stripped:
+            if self._key_material(key) == wanted:
                 return key["id"]
+
+        # 2. Name is taken by a key with different material => stale. Use a
+        #    material-derived name so this is stable across runs.
+        digest = hashlib.sha256(wanted.encode()).hexdigest()[:8]
+        if any(k.get("name") == name for k in existing):
+            name = f"{name}-{digest}"
+            for key in existing:
+                if key.get("name") == name:
+                    return key["id"]
+
         created = self._unwrap(self._sdk.create_key(name, public_key))
         return created["id"]
 

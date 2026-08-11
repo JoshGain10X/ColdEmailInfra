@@ -183,9 +183,21 @@ def run_deploy(
         # Initial shard row — mailbox_count + bison_loaded get their real values
         # later in the deploy. Pass mailbox_count up front to satisfy NOT NULL
         # in case the column default isn't set on the target schema.
+        # destroyed_at MUST be cleared here. The shard row is upserted BY DOMAIN, so
+        # redeploying a domain that was previously torn down reuses its row - and the
+        # old teardown's destroyed_at stayed set, on a shard that is now live and
+        # warming. That matters because `bison_loaded AND destroyed_at IS NULL` is the
+        # authoritative "is this shard live" test across the estate: with a stale
+        # timestamp, reconcile_fleet's orphan-VPS class reports the running VPS as
+        # abandoned and recommends destroying it (SPEND/IRREVERSIBLE), and
+        # deploy-ready domain selection treats the domain as free and can redeploy
+        # over live infrastructure. Both fire on a shard that is perfectly healthy.
+        # Observed 2026-08-08: 8 of 9 redeployed shards misreported as dead; only the
+        # never-before-deployed domain was correct.
         _upsert_shard(sb, domain, client_id=client_id, status="deploying",
                       provider=provider, region=region,
-                      mailbox_count=ctx.mailbox_count)
+                      mailbox_count=ctx.mailbox_count,
+                      destroyed_at=None)
 
         state = ShardState(domain)
 
