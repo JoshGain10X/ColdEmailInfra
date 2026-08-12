@@ -57,6 +57,7 @@ import dns.reversename
 # domain carrying corporate mail this is unrecoverable-by-accident.
 PROTECTED_DOMAINS = frozenset({
     "10xleadershipdevelopment.uk",
+    "10xmanagerscommunications.uk",
     "reachos.co",
     "10xmanagers.com",
 })

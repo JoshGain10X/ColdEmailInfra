@@ -66,8 +66,14 @@ app.add_middleware(
 # NOTE 10xcommunities.com / .co were briefly listed here on 2026-08-11 when they were the
 # intended org domain. That plan changed the same day, so they are deliberately NOT
 # protected - they remain registered 10X cold-email domains and must stay available.
+# 10xmanagerscommunications.uk — 2026-08-12: internal 10X communications domain, registered
+#   the same day. Verified clean before protecting: not in cold_email_domains or
+#   infra_domains, no shard, never sent, bare Cloudflare NS. Protected BEFORE it carries any
+#   mail, which is the right order - once it is live, a shard deploy would rewrite its MX and
+#   the breakage would only surface when someone noticed mail had stopped arriving.
 PROTECTED_DOMAINS = frozenset({
     "10xleadershipdevelopment.uk",
+    "10xmanagerscommunications.uk",
     "reachos.co",        # live Microsoft 365 MX for ReachOS company mail
     "10xmanagers.com",   # live 10X Managers company mail
 })
