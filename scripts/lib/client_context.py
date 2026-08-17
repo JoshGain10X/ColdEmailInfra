@@ -53,7 +53,11 @@ class SignatureFormula:
     optouts: list[str]
     include_pronouns_rate: float
     include_quote_rate: float
-    include_email_rate: float
+    # NOTE: there is deliberately no include_email_rate. Signatures never carry
+    # an email address (deliverability principle P04) - the address is already in
+    # the From header and recipient clients auto-link a bare one. The column
+    # still exists on signature_formulas, pinned to 0 by a CHECK constraint, but
+    # nothing reads it. Do not reintroduce the field.
     format_variants: int
 
 
@@ -132,7 +136,6 @@ def _build_signature(row: dict) -> SignatureFormula:
         optouts=row.get("optouts") or [],
         include_pronouns_rate=float(row.get("include_pronouns_rate") or 0),
         include_quote_rate=float(row.get("include_quote_rate") or 0),
-        include_email_rate=float(row.get("include_email_rate") or 0),
         format_variants=int(row.get("format_variants") or 1),
     )
 
@@ -245,7 +248,6 @@ def _load_by_query(sb: Client, where_column: str, where_value: str) -> ClientCon
             optouts=[],
             include_pronouns_rate=0,
             include_quote_rate=0,
-            include_email_rate=0,
             format_variants=1,
         )
 

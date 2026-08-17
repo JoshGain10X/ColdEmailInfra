@@ -2,7 +2,11 @@
 
 The signature formula is what makes each mailbox's emails look different from every other mailbox's — critical for deliverability because mailbox-providers can spot identical signatures across many senders and flag the whole shard.
 
-A formula has six pools and three rates. Each sender's signature is deterministic from their email address (same email → always same signature), but across 100 mailboxes you get 100 different-looking variants.
+A formula has six pools and two rates. Each sender's signature is deterministic from their email address (same email → always same signature), but across 100 mailboxes you get 100 different-looking variants.
+
+> **Hard rule: a signature never contains an email address.** Not the sender's own, not a shared inbox, not anyone's. The sender's address is already in the `From` header, so repeating it adds nothing — and recipient mail clients auto-link a bare address, putting a linked token in every message we send. This is deliverability principle P04, alongside the existing bans on URLs and hyperlinked company names.
+>
+> This is enforced in code, not left to judgement: `_sanitize_signature` in `api/jobs.py` strips any address from every signature on its way to Bison, neither generator composes one, and a CHECK constraint pins `include_email_rate` to 0 on `signature_formulas`. Do not add an address to a pool and do not reintroduce a rate for it. 835 live signatures were retro-cleaned on 2026-08-17.
 
 ## What goes into a formula
 
@@ -15,8 +19,9 @@ A formula has six pools and three rates. Each sender's signature is deterministi
 | `optouts` | Soft opt-out invitations | 12–18 | Natural ways to say "reply if you want me to stop" |
 | `include_pronouns_rate` | 0–1 | one | Default 0.3 — 30% of signatures show "(she/her)" |
 | `include_quote_rate` | 0–1 | one | Default 0.43 |
-| `include_email_rate` | 0–1 | one | Default 0.4 |
 | `format_variants` | How many name+company layouts to use | 6 | Keep at 6 unless the client wants more variation |
+
+The table has no email-address row on purpose — see the hard rule above. The `include_email_rate` column still exists on the table for schema history, but it is pinned to 0, nothing reads it, and the dataclass has no matching field.
 
 ## Interview pattern
 
@@ -85,7 +90,8 @@ These can usually stay at defaults. Only ask if the client has specific aestheti
 
 - "How often should signatures show pronouns (she/her, he/him)?" → default 30%
 - "How often should signatures include a quote?" → default 43%
-- "How often should signatures show the email address?" → default 40%
+
+Do not ask whether they want the email address shown — it is not an option. If a client asks for it, explain the auto-linking problem and say no.
 
 ### 6. Show a preview
 
@@ -136,14 +142,18 @@ After writing the row, double check:
 - `array_length(optouts, 1) BETWEEN 12 AND 18`
 - `array_length(company_names, 1) BETWEEN 3 AND 6`
 - All rates between 0 and 1
-- If `style='plaintext'` then quote/email rates should be 0 (plaintext sigs ignore them)
+- If `style='plaintext'` then the quote rate should be 0 (plaintext sigs ignore it)
+- No pool value contains an email address, a URL, or a bare `.com` — the address ban is enforced in code, but a URL smuggled into a quote or opt-out line is not
 
 ```sql
 SELECT style,
   array_length(company_names, 1) AS companies,
   array_length(titles, 1) AS titles,
   array_length(quotes, 1) AS quotes,
-  array_length(optouts, 1) AS optouts
+  array_length(optouts, 1) AS optouts,
+  -- must return 0 rows' worth of offenders:
+  (SELECT count(*) FROM unnest(sf.quotes || sf.optouts || sf.titles || sf.company_names) v
+     WHERE v ~* '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}' OR v ~* 'https?://') AS banned_tokens
 FROM signature_formulas sf
 JOIN clients c ON c.id = sf.client_id
 WHERE c.slug = 'acme-co';

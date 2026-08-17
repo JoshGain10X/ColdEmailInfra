@@ -166,7 +166,8 @@ Use `signature-formula-help.md` for the interview pattern. You'll be drafting:
 - 10–15 plausible job titles for the people sending these emails
 - 4–8 quotes/POV statements that match the client's brand voice
 - 12–18 opt-out lines (varied, natural)
-- Rates: `include_pronouns_rate` (0.2–0.4), `include_quote_rate` (0.3–0.5), `include_email_rate` (0.3–0.5)
+- Rates: `include_pronouns_rate` (0.2–0.4), `include_quote_rate` (0.3–0.5)
+- Never an email address, in any pool or as a rate. See the hard rule in `signature-formula-help.md`.
 
 Then insert the row:
 
@@ -174,14 +175,14 @@ Then insert the row:
 INSERT INTO signature_formulas (
   client_id, client_bison_workspace_id, style,
   company_names, titles, quotes, optouts,
-  include_pronouns_rate, include_quote_rate, include_email_rate, format_variants
+  include_pronouns_rate, include_quote_rate, format_variants
 )
 SELECT id, NULL, 'html',
   ARRAY[...],  -- company_names
   ARRAY[...],  -- titles
   ARRAY[...],  -- quotes
   ARRAY[...],  -- optouts
-  0.3, 0.43, 0.4, 6
+  0.3, 0.43, 6
 FROM clients WHERE slug = 'acme-co';
 ```
 

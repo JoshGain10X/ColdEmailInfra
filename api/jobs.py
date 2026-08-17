@@ -9,8 +9,10 @@ is designed to be called from a FastAPI BackgroundTask. It:
 from __future__ import annotations
 
 import csv
+import html
 import json
 import os
+import re
 import secrets
 import traceback
 from datetime import datetime, timezone
@@ -1125,18 +1127,16 @@ def _generate_signature(first: str, last: str, email: str, company: str) -> str:
     """
     import random
 
+    # No template carries the email address (P04) - it is already in the From
+    # header, and recipient clients auto-link a bare address. _sanitize_signature
+    # strips any that slip through.
     templates = [
         f"<p>{first} {last}</p>",
         f"<p><strong>{first} {last}</strong> | {company}</p>",
         f"<p>{first} {last}<br>{company}</p>",
-        f"<p>{first} {last}<br>{email}</p>",
-        f"<p><strong>{first} {last}</strong> | {company}<br>{email}</p>",
-        f"<p>{first} {last}<br>{company}<br>{email}</p>",
         f"<p>{first} {last} - {company}</p>",
-        f"<p>{email}</p>",
         f"<p>{first} {last}, {company}</p>",
         f"<p>{first}<br>{company}</p>",
-        f"<p>{first} {last} | {email}</p>",
         f"<p>{first} from {company}</p>",
         f"<p>Best,<br>{first} {last}</p>",
         f"<p>Thanks,<br>{first}</p>",
@@ -1150,23 +1150,70 @@ def _generate_signature(first: str, last: str, email: str, company: str) -> str:
     return _sanitize_signature(sig)
 
 
-def _sanitize_signature(text: str) -> str:
-    """Strip em dashes (U+2014) and en dashes (U+2013) from signature
-    content before it ships into Bison.
+_SIG_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
-    Em dashes in cold email are an LLM-generated-copy fingerprint that
-    Gmail/Outlook classifiers flag. Almost no humans type them naturally
-    on keyboards — their presence at scale is a deliverability tell.
+
+def _strip_emails_from_signature(text: str) -> str:
+    """Remove any email address from signature content, leaving no debris.
+
+    Signatures must not carry an email address (deliverability principle P04).
+    Recipient clients auto-link a bare address, which adds a linked token to
+    every message for no gain — the sender's address is already in the From
+    header. Removed fleet-wide 2026-08-17.
+
+    Handles all the shapes the generators used to emit: the address on its own
+    paragraph, appended after a <br>, or inline behind a separator. Whole
+    paragraphs that contained nothing but the address are dropped rather than
+    left empty, and dangling separators are tidied.
+    """
+    out = text
+    # The address on its own paragraph -> drop the paragraph
+    def _drop_p(m):
+        inner = re.sub(r"<[^>]+>", "", m.group(1))
+        inner = html.unescape(inner).strip()
+        return "" if inner and _SIG_EMAIL_RE.fullmatch(inner) else m.group(0)
+
+    out = re.sub(r"<p[^>]*>(.*?)</p>", _drop_p, out, flags=re.S)
+    # Appended after a line break, or inline behind a separator
+    out = re.sub(r"\s*<br\s*/?>\s*" + _SIG_EMAIL_RE.pattern, "", out)
+    out = re.sub(r"\s*[|·,\-]\s*" + _SIG_EMAIL_RE.pattern, "", out)
+    # Plaintext style: a line that is only the address
+    out = "\n".join(l for l in out.split("\n") if not _SIG_EMAIL_RE.fullmatch(l.strip()))
+    # Any survivor, then tidy the debris removal can leave behind
+    out = _SIG_EMAIL_RE.sub("", out)
+    out = re.sub(r"<p[^>]*>\s*(<br\s*/?>)?\s*</p>", "", out)
+    out = re.sub(r"(<br\s*/?>\s*)+</p>", "</p>", out)
+    out = re.sub(r"\s*[|·]\s*</p>", "</p>", out)
+    # Tidy the gap an address removed from mid-sentence leaves behind
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"<p([^>]*)>\s+", r"<p\1>", out)
+    out = re.sub(r"\s+</p>", "</p>", out)
+    return re.sub(r"\n{2,}", "\n", out).strip()
+
+
+def _sanitize_signature(text: str) -> str:
+    """Scrub signature content before it ships into Bison.
+
+    Two rules, both deliverability-driven:
+
+    1. Em dashes (U+2014) and en dashes (U+2013) become hyphens. Em dashes in
+       cold email are an LLM-generated-copy fingerprint that Gmail/Outlook
+       classifiers flag. Almost no humans type them naturally on keyboards -
+       their presence at scale is a deliverability tell.
+    2. Email addresses are removed entirely (see
+       _strip_emails_from_signature). Signatures never carry an address.
 
     Belt-and-suspenders enforcement:
     - Postgres CHECK constraints reject em dashes at INSERT/UPDATE time
     - Both signature generators call this on their output
     - run_load_to_bison calls this on every signature before PATCH
 
-    If em dashes ever appear in a signature in production, this is where
-    to widen the scrub.
+    This is the single chokepoint every signature passes through, so widening
+    the scrub here closes every code path at once.
     """
-    return text.replace("—", "-").replace("–", "-")
+    text = text.replace("—", "-").replace("–", "-")
+    return _strip_emails_from_signature(text)
 
 
 def _email_seed(email: str) -> int:
@@ -1209,7 +1256,6 @@ def _generate_signature_from_formula(first: str, last: str, email: str, formula)
     fmt = seed % max(1, formula.format_variants)
     include_pronouns = (seed % 10) < int(formula.include_pronouns_rate * 10)
     include_quote = (seed % 7) < int(formula.include_quote_rate * 7)
-    include_email = (seed % 5) < int(formula.include_email_rate * 5)
 
     quote = formula.quotes[(seed // 4) % len(formula.quotes)] if formula.quotes else None
     optout = formula.optouts[seed % len(formula.optouts)] if formula.optouts else None
@@ -1236,17 +1282,10 @@ def _generate_signature_from_formula(first: str, last: str, email: str, formula)
     else:
         company_line = f"<p>{title}, {company}</p>"
 
+    # Signatures never carry an email address (P04) - the only optional middle
+    # element is the quote. See _strip_emails_from_signature.
     middle = []
-    if include_email and include_quote and quote:
-        if seed % 3 == 0:
-            middle.append(f"<p>{email}</p>")
-            middle.append(f"<p><em>\"{quote}\"</em></p>")
-        else:
-            middle.append(f"<p><em>\"{quote}\"</em></p>")
-            middle.append(f"<p>{email}</p>")
-    elif include_email:
-        middle.append(f"<p>{email}</p>")
-    elif include_quote and quote:
+    if include_quote and quote:
         middle.append(f"<p><em>\"{quote}\"</em></p>")
 
     parts = [name_line, company_line] + middle
