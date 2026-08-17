@@ -19,9 +19,13 @@ fi
 docker stop coldemail-ingestion-monitor 2>/dev/null || true
 docker rm coldemail-ingestion-monitor 2>/dev/null || true
 docker build -t coldemail-ingestion-monitor:latest -f monitor/Dockerfile .
+# ~/.ssh is mounted read-only so Layer 3 can probe shard resource ceilings
+# (inotify usage, dovecot imap-login config). Without it Layer 3 logs a skip and
+# the other two layers run unaffected.
 docker run -d \
   --name coldemail-ingestion-monitor \
   --env-file "$ENV_FILE" \
+  -v "$HOME/.ssh:/root/.ssh:ro" \
   --log-opt max-size=10m --log-opt max-file=3 \
   --tmpfs /tmp:size=50M \
   --restart unless-stopped \

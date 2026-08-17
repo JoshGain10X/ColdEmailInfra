@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inbound-ingestion health monitor for the cold-email fleet.
 
-Two checks, both aimed at the failure mode that bit us in Jul 2026: a shard's
+Three checks. The first two are aimed at the failure mode that bit us in Jul 2026: a shard's
 Bison IMAP reply-ingestion silently stalls while Bison still reports the sender
 as "Connected". Status flags lie, so we watch *behaviour* instead.
 
@@ -20,6 +20,18 @@ as "Connected". Status flags lie, so we watch *behaviour* instead.
     single mailbox is quiet for days at a time even on a perfectly healthy
     shard. Rolled up per shard so one dead shard is one alert, not 100.
 
+  Layer 3 - resource-ceiling guard (prevention):
+    Watches the two silent ceilings that left every shard degraded for months
+    with no alert: fs.inotify.max_user_instances (Dovecot needs ~225, kernel
+    default is 128, so it silently stopped watching mailboxes) and Dovecot's
+    imap-login process_limit (one process per connection in high-security mode,
+    ~400 sessions against a 500 ceiling, connections dropped). Both are fixed
+    now; this layer notices if that regresses or if a growing mailbox count
+    eats the new headroom. Also flags imap-login config drift directly, so we
+    hear about it before saturation rather than after. Reported as a WARNING,
+    not a critical - it is degradation, not an outage. Failsafe: unreachable
+    shards are skipped, and a missing SSH key skips the layer entirely.
+
 On any finding it POSTs a single JSON alert to N8N_ALERT_WEBHOOK_URL (an n8n
 webhook that notifies MS Teams). If the webhook is unset it just logs - so the
 monitor is safe to run before the n8n side is wired.
@@ -32,6 +44,9 @@ Env (from .env.v2):
   STALL_HOURS   (default 18)  - ingestion-age threshold
   MIN_SENT      (default 5)   - only judge shards whose senders have really sent
   MAX_REPLY_PAGES (default 100) - cap on the reply-stream walk per workspace
+  SHARD_SSH_KEY (default /root/.ssh/id_ed25519) - Layer 3; layer skipped if absent
+  SHARD_SSH_USER (default admin)  - Layer 3 ssh user
+  INOTIFY_WARN_PCT (default 80)   - Layer 3 inotify-usage alert threshold
 """
 from __future__ import annotations
 import json, os, sys
@@ -48,6 +63,11 @@ WEBHOOK = os.environ.get("N8N_ALERT_WEBHOOK_URL", "")
 STALL_HOURS = float(os.environ.get("STALL_HOURS", "18"))
 MIN_SENT = int(os.environ.get("MIN_SENT", "5"))
 MAX_REPLY_PAGES = int(os.environ.get("MAX_REPLY_PAGES", "100"))
+# Layer 3: shard resource ceilings. Optional - skipped cleanly if the deploy key
+# is not mounted, so the monitor never breaks because of it.
+SHARD_SSH_KEY = os.environ.get("SHARD_SSH_KEY", "/root/.ssh/id_ed25519")
+SHARD_SSH_USER = os.environ.get("SHARD_SSH_USER", "admin")
+INOTIFY_WARN_PCT = float(os.environ.get("INOTIFY_WARN_PCT", "80"))
 CF = "https://api.cloudflare.com/client/v4"
 
 
@@ -104,7 +124,7 @@ def bison(path, method="GET", body=None, tok=None):
 def active_shards() -> list[dict]:
     """Shards that SHOULD be ingesting: live + loaded into Bison."""
     url = (f"{SB_URL}/rest/v1/infra_shards"
-           "?select=domain,bison_workspace,status,bison_loaded"
+           "?select=domain,vps_ip,bison_workspace,status,bison_loaded"
            "&status=in.(active,verified)&bison_loaded=eq.true")
     r = requests.get(url, headers={"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}, timeout=30)
     return r.json()
@@ -212,8 +232,97 @@ def layer2_ingestion_stall() -> list[dict]:
     return stalled
 
 
+# ---------- Layer 3: shard resource ceilings ----------
+def layer3_shard_resources() -> list[dict]:
+    """Catch the silent-ceiling class of failure on the shards themselves.
+
+    Two ceilings put every shard into a degraded state for months without a
+    single alert, because nothing watched them (see
+    project-shard-dovecot-inotify-limits):
+
+      - fs.inotify.max_user_instances: Dovecot takes one instance per watched
+        mailbox. At the kernel default of 128 against ~225 demand, every shard
+        sat pinned at 128/128 and Dovecot silently stopped watching the
+        overflow, disabling new-mail notification for those mailboxes.
+      - Dovecot service(imap-login) process_limit: in high-security mode it
+        forks one process per connection, so ~400 sessions ran into a 500
+        ceiling and connections were dropped outright.
+
+    Both are now configured correctly, so this layer exists to notice the
+    moment that regresses - a rebuilt shard, a reverted config, or simply a
+    higher mailbox count pushing demand past the new headroom. It also flags
+    config drift on imap-login directly, so we hear about it before saturation
+    rather than after.
+
+    Failsafe by design: any shard we cannot reach is logged and skipped, never
+    alerted on, and a missing key skips the whole layer. A monitoring check must
+    not become its own source of pages.
+    """
+    if not os.path.exists(SHARD_SSH_KEY):
+        log(f"Layer 3 skipped: no shard SSH key at {SHARD_SSH_KEY}")
+        return []
+    try:
+        sys.path.insert(0, "/app/scripts")
+        from lib.mailserver import MailserverClient  # type: ignore
+    except Exception as exc:
+        log(f"Layer 3 skipped: cannot import MailserverClient ({exc})")
+        return []
+
+    findings, checked, unreachable = [], 0, 0
+    for shard in active_shards():
+        domain, ip = shard.get("domain"), shard.get("vps_ip")
+        if not ip:
+            continue
+        try:
+            ms = MailserverClient(ip, SHARD_SSH_KEY, user=SHARD_SSH_USER)
+            ms.connect()
+            try:
+                ino = ms.verify_inotify_limits()
+                dov = ms.verify_dovecot_limits()
+                _, drops, _ = ms.sudo(
+                    "docker exec mailserver sh -c "
+                    "'grep -ac \"process_limit (.*) reached\" /var/log/mail/mail.log || true'",
+                    check=False,
+                )
+            finally:
+                ms.close()
+        except Exception as exc:
+            unreachable += 1
+            log(f"Layer 3: {domain} unreachable, skipped ({type(exc).__name__})")
+            continue
+
+        checked += 1
+        issues = []
+        try:
+            inuse, limit = int(ino.get("inuse", 0)), int(ino.get("inst", 0))
+            if limit and (100.0 * inuse / limit) >= INOTIFY_WARN_PCT:
+                issues.append(f"inotify {inuse}/{limit} ({100.0*inuse/limit:.0f}% of limit)")
+        except (TypeError, ValueError):
+            pass
+        if dov.get("imap_login_service_count") != "0":
+            issues.append(
+                f"imap-login not in high-performance mode "
+                f"(service_count={dov.get('imap_login_service_count')})"
+            )
+        try:
+            n = int((drops or "0").strip().splitlines()[-1])
+            if n > 0:
+                issues.append(f"{n} 'process_limit reached' log line(s) - connections being dropped")
+        except (ValueError, IndexError):
+            pass
+
+        if issues:
+            findings.append({"shard": domain, "issues": issues})
+            log(f"Layer 3 RESOURCE: {domain} - " + "; ".join(issues))
+
+    if not findings:
+        log(f"Layer 3 OK: {checked} shard(s) within resource ceilings"
+            + (f" ({unreachable} unreachable, skipped)" if unreachable else ""))
+    return findings
+
+
 # ---------- alerting ----------
-def alert(dns_bad, stalled):
+def alert(dns_bad, stalled, resources=None):
     lines = []
     if dns_bad:
         lines.append(f"{len(dns_bad)} dead mail-host AAAA record(s) (reply-ingestion risk): "
@@ -221,14 +330,21 @@ def alert(dns_bad, stalled):
     if stalled:
         lines.append(f"{len(stalled)} shard(s) with stalled inbound ingestion: "
                      + ", ".join(s["shard"] for s in stalled[:10]))
+    resources = resources or []
+    if resources:
+        lines.append(f"{len(resources)} shard(s) hitting a resource ceiling: "
+                     + ", ".join(r["shard"] for r in resources[:10]))
     summary = "Cold-email ingestion monitor: " + " | ".join(lines)
     payload = {
         "source": "coldemail-ingestion-monitor",
-        "severity": "critical",
+        # A resource ceiling is degradation, not an outage - only page as
+        # critical when ingestion or DNS is actually broken.
+        "severity": "critical" if (dns_bad or stalled) else "warning",
         "summary": summary,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "dns_drift": dns_bad,
         "stalled_shards": stalled,
+        "resource_ceilings": resources,
     }
     log("ALERT: " + summary)
     if WEBHOOK:
@@ -245,8 +361,9 @@ def main():
     log("=== ingestion health check start ===")
     dns_bad = layer1_dns_drift()
     stalled = layer2_ingestion_stall()
-    if dns_bad or stalled:
-        alert(dns_bad, stalled)
+    resources = layer3_shard_resources()
+    if dns_bad or stalled or resources:
+        alert(dns_bad, stalled, resources)
         log("=== finished WITH findings ===")
     else:
         log("=== finished: all healthy ===")
