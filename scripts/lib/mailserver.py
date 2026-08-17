@@ -341,7 +341,11 @@ class MailserverClient:
         and the previous local.conf is restored if it does not parse - a bad
         config here would take mail down on the shard.
 
-        Idempotent: same file, same result. Safe on every deploy and as a retrofit.
+        Idempotent AND cheap: if the live config already matches and imap-login
+        is already in high-performance mode, this returns without restarting
+        dovecot. That is what makes it safe to call unconditionally on every
+        deploy rather than gating it behind a step flag - a flag would mean a
+        rebuilt or redeployed shard silently keeps stale limits.
         """
         wd = self._workdir()
         body = (DMS_TEMPLATE_DIR / "dovecot.cf").read_text()
@@ -349,7 +353,17 @@ class MailserverClient:
         # 1. Persist on the host so container recreation keeps it.
         self.upload_text(body, f"{wd}/docker-data/dms/config/dovecot.cf")
 
-        # 2. Copy into the live container, validating before we commit to it.
+        # 2. Already correct? Then do not touch dovecot.
+        rc, live, _ = self.sudo(
+            "docker exec mailserver cat /etc/dovecot/local.conf 2>/dev/null || true",
+            check=False,
+        )
+        if live.strip() == body.strip():
+            effective = self.verify_dovecot_limits()
+            if effective.get("imap_login_service_count") == "0":
+                return
+
+        # 3. Copy into the live container, validating before we commit to it.
         script = (
             "set -e; "
             "docker exec mailserver cp /etc/dovecot/local.conf /tmp/local.conf.bak; "

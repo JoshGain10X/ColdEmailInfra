@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib.mailserver import MailserverClient, INOTIFY_MAX_USER_INSTANCES
 from lib.state import ShardState
 
 
@@ -149,6 +150,74 @@ def check_tls(domain: str) -> tuple[str, str]:
     return ("PASS" if verified else "WARN"), detail
 
 
+def check_hardening(state: ShardState, domain: str) -> list[tuple[str, str, str]]:
+    """Assert the shard's resource ceilings and cert SAN coverage.
+
+    Neither was previously checked, so a shard could deploy degraded from birth
+    and still report ALL PASSED:
+
+    - fs.inotify.max_user_instances at the kernel default of 128 against ~225
+      demand means Dovecot silently stops watching mailboxes past the ceiling.
+    - Dovecot imap-login in high-security mode forks one process per connection
+      and drops them past a 500-process limit at ~400 concurrent sessions.
+    - The TLS cert covering only mail.<root> does not match the per-subdomain MX
+      hosts senders actually connect to, which permanently blocks MTA-STS
+      enforce. check_tls only probes mail.<root>, so it passes a single-SAN cert.
+
+    See project-shard-dovecot-inotify-limits and
+    reference-mta-sts-enforce-blocked-by-cert.
+    """
+    rows: list[tuple[str, str, str]] = []
+    vps_ip = (state.get("vps") or {}).get("ip")
+    if not vps_ip:
+        return [("hardening probe", "FAIL", "(no vps ip in state)")]
+
+    ssh_key = os.environ.get("SSH_PRIVATE_KEY_PATH", "~/.ssh/id_ed25519")
+    ssh_user = (state.get("vps") or {}).get("ssh_user") or os.environ.get("SSH_USER", "admin")
+    try:
+        ms = MailserverClient(vps_ip, ssh_key, user=ssh_user)
+        ms.connect()
+        try:
+            ino = ms.verify_inotify_limits()
+            dov = ms.verify_dovecot_limits()
+            _, sans_out, _ = ms.sudo(
+                f"openssl x509 -in /etc/letsencrypt/live/{_mail_hostname(domain)}/fullchain.pem "
+                f"-noout -ext subjectAltName 2>/dev/null || true",
+                check=False,
+            )
+        finally:
+            ms.close()
+    except Exception as exc:
+        return [("hardening probe", "FAIL", f"({type(exc).__name__}: {exc})")]
+
+    inst = ino.get("inst")
+    rows.append((
+        "fs.inotify.max_user_instances raised",
+        _status(inst == str(INOTIFY_MAX_USER_INSTANCES)),
+        f"{inst} (expected {INOTIFY_MAX_USER_INSTANCES}), {ino.get('inuse')} in use",
+    ))
+    sc = dov.get("imap_login_service_count")
+    rows.append((
+        "dovecot imap-login high-performance mode",
+        _status(sc == "0"),
+        f"service_count={sc} (expected 0), process_limit={dov.get('imap_login_process_limit')}",
+    ))
+
+    sans = {t.strip().removeprefix("DNS:") for t in (sans_out or "").replace("\n", ",").split(",") if "DNS:" in t}
+    expected = [f"mail.{sub}.{domain}" for sub in (state.get("subdomains") or [])]
+    missing = [n for n in expected if n not in sans]
+    if not sans:
+        rows.append(("cert covers every sending-subdomain MX host", "WARN",
+                     "(no LE cert on disk - ssl_type=self-signed?)"))
+    else:
+        rows.append((
+            "cert covers every sending-subdomain MX host",
+            _status(not missing),
+            f"{len(sans)} SANs; missing {len(missing)}" + (f" e.g. {missing[:2]}" if missing else ""),
+        ))
+    return rows
+
+
 def _status(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
@@ -187,6 +256,8 @@ def main(domain: str) -> None:
 
     tls_status, tls_info = check_tls(domain)
     passed &= _print_rows("TLS certificate", [("465 cert matches mail hostname", tls_status, tls_info)])
+
+    passed &= _print_rows("Hardening ceilings + cert coverage", check_hardening(state, domain))
 
     click.echo("")
     click.echo("Manual checks remaining:")

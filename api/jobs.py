@@ -40,7 +40,7 @@ from lib.client_context import (
 from lib.cloudflare import CloudflareClient
 from lib.contabo import ContaboClient
 from lib.generate import SHARED_MAILBOX_PASSWORD, generate_mailboxes, pick_subdomains
-from lib.mailserver import MailserverClient
+from lib.mailserver import MailserverClient, INOTIFY_MAX_USER_INSTANCES
 from lib.state import ShardState, SHARDS_DIR
 from lib.webdock import WebdockClient
 
@@ -592,21 +592,38 @@ def run_deploy(
             state.mark_step_done("setup_landing")
         _append_log(sb, job_id, "Landing page step complete", step=8)
 
-        # Step 6.7: Memory hardening (swap + Caddy cgroup cap + auto-restart).
-        # Runs after Caddy is installed (MTA-STS/landing steps). The ~2GB
-        # no-swap boxes OOM-kill Caddy under Bison's IMAP reply-polling load;
-        # this backstops it cost-neutrally. Idempotent. See
-        # project-shard-memory-hardening / MailserverClient.apply_memory_hardening.
-        if not state.is_step_done("memory_hardening"):
-            _append_log(sb, job_id, "Applying memory hardening (swap + Caddy cap)")
-            ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
-            ms.connect()
-            try:
-                ms.apply_memory_hardening()
-            finally:
-                ms.close()
-            state.mark_step_done("memory_hardening")
-        _append_log(sb, job_id, "Memory hardening applied")
+        # Step 6.7: Host + Dovecot hardening.
+        #   - apply_memory_hardening: swap backstop, Caddy cgroup cap, and the
+        #     raised fs.inotify limits (Dovecot needs ~225 instances per
+        #     100-mailbox shard; the kernel default of 128 silently disables
+        #     new-mail notification for the overflow).
+        #   - apply_dovecot_limits: imap-login high-performance mode, so ~400
+        #     concurrent sessions stop running into a 500-process ceiling.
+        #
+        # Deliberately NOT gated behind is_step_done. Both are idempotent, and
+        # apply_dovecot_limits returns without touching dovecot when the live
+        # config already matches - so re-running is cheap. Gating them was the
+        # bug: every existing shard already has memory_hardening marked done, so
+        # a flag would mean a rebuilt or redeployed shard silently keeps stale
+        # limits and needs hand-fixing again. See
+        # project-shard-dovecot-inotify-limits / project-shard-memory-hardening.
+        _append_log(sb, job_id, "Applying host + dovecot hardening (swap, Caddy cap, inotify, imap-login)")
+        ms = MailserverClient(vps["ip"], ssh_key, user=ssh_user)
+        ms.connect()
+        try:
+            ms.apply_memory_hardening()
+            ms.apply_dovecot_limits()
+            hardening = {**ms.verify_inotify_limits(), **ms.verify_dovecot_limits()}
+        finally:
+            ms.close()
+        state.mark_step_done("memory_hardening")
+        state.mark_step_done("dovecot_limits")
+        _append_log(
+            sb, job_id,
+            f"Hardening applied: inotify={hardening.get('inuse')}/{hardening.get('inst')} "
+            f"imap-login service_count={hardening.get('imap_login_service_count')} "
+            f"process_limit={hardening.get('imap_login_process_limit')}"
+        )
 
         # Step 7: Setup DKIM
         if not state.is_step_done("setup_dkim"):
@@ -1083,6 +1100,7 @@ def run_verify(job_id: str, client_id: str, domain: str) -> None:
         # TLS
         import ssl as ssl_mod
         _append_log(sb, job_id, "Checking TLS certificate", step=4)
+        cert = None  # stays None if the probe never completes (e.g. ISP blocks 465)
         try:
             ctx = ssl_mod.create_default_context()
             with socket.create_connection((host, 465), timeout=10) as sock:
@@ -1105,6 +1123,68 @@ def run_verify(job_id: str, client_id: str, domain: str) -> None:
             tls_status = f"FAIL ({exc})"
             all_passed = False
         _append_log(sb, job_id, f"  TLS: {tls_status}")
+
+        # Cert SAN coverage. Every sending subdomain has its own MX target
+        # (team.<root> MX -> mail.team.<root>), so a cert covering only
+        # mail.<root> does not match the hostname a sender connects to. Harmless
+        # under opportunistic TLS and MTA-STS mode=testing, but it silently
+        # blocks ever enforcing. Probing only mail.<root> (as this check used to)
+        # passes a single-SAN cert, so assert coverage explicitly.
+        expected_sans = [f"mail.{sub}.{domain}" for sub in (state.get("subdomains") or [])]
+        if cert is None:
+            # No cert retrieved (timeout / blocked port). Cannot judge coverage,
+            # so do NOT fail the deploy on a probe we were unable to run.
+            _append_log(sb, job_id, "  CERT SANS: SKIP (no cert retrieved - see TLS result above)")
+        else:
+            sans = [v for k, v in (cert.get("subjectAltName") or []) if k == "DNS"]
+            missing_sans = [n for n in expected_sans if n not in sans]
+            if missing_sans:
+                all_passed = False
+                _append_log(
+                    sb, job_id,
+                    f"  CERT SANS: FAIL - {len(missing_sans)} sending-subdomain MX host(s) "
+                    f"not on the cert (e.g. {missing_sans[:3]}). MTA-STS enforce would refuse mail."
+                )
+            else:
+                _append_log(
+                    sb, job_id,
+                    f"  CERT SANS: PASS ({len(sans)} names cover all "
+                    f"{len(expected_sans)} sending subdomains)"
+                )
+
+        # Hardening ceilings. A shard that deploys without these is degraded
+        # from birth - Dovecot stops watching mailboxes past 128 inotify
+        # instances, and imap-login drops connections past 500 processes - and
+        # nothing else in this verify would notice.
+        _append_log(sb, job_id, "Checking hardening ceilings", step=4)
+        try:
+            ms = MailserverClient(vps_ip, ssh_key, user=ssh_user)
+            ms.connect()
+            try:
+                ino = ms.verify_inotify_limits()
+                dov = ms.verify_dovecot_limits()
+            finally:
+                ms.close()
+            problems = []
+            if ino.get("inst") != str(INOTIFY_MAX_USER_INSTANCES):
+                problems.append(f"inotify instances={ino.get('inst')} expected={INOTIFY_MAX_USER_INSTANCES}")
+            if dov.get("imap_login_service_count") != "0":
+                problems.append(
+                    f"imap-login service_count={dov.get('imap_login_service_count')} expected=0 "
+                    f"(high-performance mode)"
+                )
+            if problems:
+                all_passed = False
+                _append_log(sb, job_id, "  HARDENING: FAIL - " + "; ".join(problems))
+            else:
+                _append_log(
+                    sb, job_id,
+                    f"  HARDENING: PASS (inotify limit {ino.get('inst')}, "
+                    f"imap-login high-performance, {ino.get('inuse')} instances in use)"
+                )
+        except Exception as exc:
+            all_passed = False
+            _append_log(sb, job_id, f"  HARDENING: FAIL (could not probe: {type(exc).__name__}: {exc})")
 
         if all_passed:
             state.mark_step_done("verify")
