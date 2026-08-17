@@ -12,11 +12,13 @@ as "Connected". Status flags lie, so we watch *behaviour* instead.
     to go dark. Cheap; catches the cause before the symptom.
 
   Layer 2 - ingestion-stall detector (detection, any cause):
-    Every actively-sending mailbox receives inbound constantly (warmup, bounces,
-    real replies). So an active shard whose *freshest ingested item* is older
-    than STALL_HOURS is stalled - regardless of whether the cause is DNS, a
-    cert, auth, or a dropped IMAP connection. Rolled up per shard so one dead
-    shard is one alert, not 100.
+    An actively-sending shard receives inbound constantly (bounces, real
+    replies), so a shard whose freshest ingested item is older than STALL_HOURS
+    is stalled - regardless of whether the cause is DNS, a cert, auth, or a
+    dropped IMAP connection. Judged per SHARD across every one of its mailboxes,
+    not per sampled mailbox: inbound spreads thinly over ~100 mailboxes, so any
+    single mailbox is quiet for days at a time even on a perfectly healthy
+    shard. Rolled up per shard so one dead shard is one alert, not 100.
 
 On any finding it POSTs a single JSON alert to N8N_ALERT_WEBHOOK_URL (an n8n
 webhook that notifies MS Teams). If the webhook is unset it just logs - so the
@@ -29,11 +31,11 @@ Env (from .env.v2):
   N8N_ALERT_WEBHOOK_URL       - where alerts go (optional; logs if unset)
   STALL_HOURS   (default 18)  - ingestion-age threshold
   MIN_SENT      (default 5)   - only judge shards whose senders have really sent
-  SAMPLE_PER_SHARD (default 3)- mailboxes sampled per shard
+  MAX_REPLY_PAGES (default 100) - cap on the reply-stream walk per workspace
 """
 from __future__ import annotations
 import json, os, sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -45,7 +47,7 @@ SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 WEBHOOK = os.environ.get("N8N_ALERT_WEBHOOK_URL", "")
 STALL_HOURS = float(os.environ.get("STALL_HOURS", "18"))
 MIN_SENT = int(os.environ.get("MIN_SENT", "5"))
-SAMPLE_PER_SHARD = int(os.environ.get("SAMPLE_PER_SHARD", "3"))
+MAX_REPLY_PAGES = int(os.environ.get("MAX_REPLY_PAGES", "100"))
 CF = "https://api.cloudflare.com/client/v4"
 
 
@@ -108,6 +110,59 @@ def active_shards() -> list[dict]:
     return r.json()
 
 
+def workspace_senders() -> list[dict]:
+    """Every sender in the CURRENT workspace, walked page by page.
+
+    We used to fetch per shard with `?search=<domain>`, but that endpoint caps
+    what it returns - on a 100-mailbox shard it handed back only ~15 senders,
+    always the same subdomain. Shards were then judged on that unrepresentative
+    slice, and any shard whose slice happened to be low-volume was written off
+    as "not judged". Walk the full list instead.
+    """
+    page, out = 1, []
+    while True:
+        r = bison(f"/api/sender-emails?per_page=100&page={page}")
+        rows = r.get("data") or []
+        out += rows
+        meta = r.get("meta") or {}
+        if page >= (meta.get("last_page") or 1) or not rows:
+            break
+        page += 1
+    return out
+
+
+def newest_ingest_by_host(sender_host: dict[int, str], cutoff: str) -> dict[str, str]:
+    """Newest ingested inbound item per mail host, from the workspace stream.
+
+    Freshness has to be judged per SHARD, not per mailbox. A shard carries ~100
+    mailboxes and inbound spreads thinly across all of them, so any individual
+    mailbox routinely goes days without a bounce or reply while the shard as a
+    whole ingests constantly. Sampling a handful of mailboxes and taking the
+    freshest reads those quiet mailboxes as an outage - that is what produced
+    the false critical alerts on 2026-08-15/16, when the five "stalled" shards
+    had in fact ingested 21-60 items each during the alert window.
+
+    /api/replies is newest-first, so the first time a host appears is its newest
+    item. Walk back only as far as the stall cutoff.
+    """
+    newest: dict[str, str] = {}
+    page = 1
+    while page <= MAX_REPLY_PAGES:
+        r = bison(f"/api/replies?per_page=100&page={page}")
+        rows = r.get("data") or []
+        if not rows:
+            break
+        for x in rows:
+            created = str(x.get("created_at") or "")
+            if created[:19] < cutoff:
+                return newest
+            host = sender_host.get(x.get("sender_email_id"))
+            if host and host not in newest:
+                newest[host] = created
+        page += 1
+    return newest
+
+
 def layer2_ingestion_stall() -> list[dict]:
     if not (BASE and SUPER and SB_URL and SB_KEY):
         log("Layer 2 skipped: missing BISON/SUPABASE env")
@@ -124,26 +179,27 @@ def layer2_ingestion_stall() -> list[dict]:
         if not remaining:
             break
         bison("/api/workspaces/switch-workspace", "POST", {"team_id": w["id"]})
+        by_host: dict[str, list[dict]] = {}
+        sender_host: dict[int, str] = {}
+        for s in workspace_senders():
+            if s.get("type") == "custom":
+                by_host.setdefault(s.get("imap_server"), []).append(s)
+                sender_host[s.get("id")] = s.get("imap_server")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=STALL_HOURS)).isoformat()[:19]
+        newest = newest_ingest_by_host(sender_host, cutoff)
         for domain in list(remaining):
             mail_host = f"mail.{domain}"
-            res = bison(f"/api/sender-emails?search={domain}&per_page=100")
-            senders = [s for s in (res.get("data") or [])
-                       if s.get("type") == "custom" and s.get("imap_server") == mail_host
-                       and (s.get("emails_sent_count") or 0) >= MIN_SENT]
+            senders = [s for s in by_host.get(mail_host, [])
+                       if (s.get("emails_sent_count") or 0) >= MIN_SENT]
             if not senders:
                 continue  # this shard's senders aren't in this workspace
-            freshest = None
-            for s in senders[:SAMPLE_PER_SHARD]:
-                rep = bison(f"/api/sender-emails/{s['id']}/replies?per_page=1")
-                data = rep.get("data") or []
-                if data:
-                    age = _age_hours(data[0]["created_at"])
-                    freshest = age if freshest is None else min(freshest, age)
             del remaining[domain]  # matched - don't search further workspaces
+            # Anything the shard ingested inside the window puts it in the clear.
+            freshest = _age_hours(newest[mail_host]) if mail_host in newest else None
             if freshest is None or freshest > STALL_HOURS:
                 stalled.append({
                     "shard": domain, "workspace": w["name"],
-                    "senders_checked": len(senders[:SAMPLE_PER_SHARD]),
+                    "mailboxes_live": len(senders),
                     "hours_since_last_ingest": round(freshest, 1) if freshest is not None else None,
                 })
                 log(f"Layer 2 STALL: {domain} ({w['name']}) - "
