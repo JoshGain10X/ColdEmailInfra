@@ -1,11 +1,45 @@
 # Overrides for docker-mailserver's Dovecot configuration.
 # Loaded via /tmp/docker-mailserver/dovecot.cf inside the container.
 
-# Bison holds ~1 persistent IMAP connection per sender mailbox.
-# Default (100) saturates at ~48 senders; 500 gives headroom for
-# 100 mailboxes + LMTP delivery + login processes.
+# Left at the DMS-safe baseline; the services that actually need headroom are
+# given explicit limits below rather than inflating every service.
 default_process_limit = 500
 
 # Default is 10 per user per IP. Bison may open multiple IMAP
 # connections per mailbox from the same server IP.
 mail_max_userip_connections = 50
+
+# service imap needs one process per authenticated session. Bison holds ~4 IMAP
+# connections per sender mailbox and Instantly warmup another ~4, so a
+# 100-mailbox shard runs ~800 concurrent sessions - not the ~100 assumed when
+# this file was first written.
+service imap {
+  process_limit = 1200
+}
+
+# imap-login runs in high-security mode by default (service_count = 1), forking
+# one login process per connection. At ~800 concurrent connections that
+# exhausted process_limit and Dovecot silently dropped client connections:
+#   "service(imap-login): process_limit (500) reached, connections are dropped"
+# Bison's IMAP sessions were dropped mid-flight, never reconnected, and inbound
+# reply-ingestion stalled fleet-wide while senders still reported "Connected"
+# (incident 2026-08-14, all 20 shards). High-performance mode lets a handful of
+# login processes carry every connection, removing the ceiling and freeing
+# ~400 processes per shard.
+service imap-login {
+  service_count = 0
+  client_limit = 1000
+  process_min_avail = 4
+  process_limit = 64
+  vsz_limit = 512M
+}
+
+# auth/anvil must be able to serve the summed process_limits of the protocol
+# services above, or Dovecot warns and can stall logins under load.
+service auth {
+  client_limit = 2000
+}
+
+service anvil {
+  client_limit = 2000
+}
