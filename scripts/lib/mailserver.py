@@ -48,6 +48,19 @@ SWAPPINESS = 10
 CADDY_MEMORY_HIGH = "300M"
 CADDY_MEMORY_MAX = "450M"
 
+# Inotify limits (see project-shard-dovecot-inotify-limits). Dovecot takes an
+# inotify instance per watched mailbox to detect new mail and drive IMAP IDLE.
+# A 100-mailbox shard needs ~225 instances; the kernel default is 128, so every
+# shard built before 2026-08-17 sat pinned at 128/128 with notification
+# silently DISABLED for the overflow ("Inotify instance limit for user 5000
+# (UID docker) exceeded, disabling"). 1024 gives ~4.5x headroom over measured
+# demand. max_user_watches is scaled to RAM by the kernel (12818 on these
+# boxes) and was not the binding limit - measured demand is ~340-525 - but we
+# raise it too so a bigger mailbox count cannot quietly hit the next ceiling.
+INOTIFY_MAX_USER_INSTANCES = 1024
+INOTIFY_MAX_USER_WATCHES = 262144
+SYSCTL_DROPIN_PATH = "/etc/sysctl.d/60-mailserver-inotify.conf"
+
 
 def postfix_main_cf_override() -> str:
     """Return the postfix-main.cf override body applying the rate cap.
@@ -269,17 +282,21 @@ class MailserverClient:
         return result
 
     def apply_memory_hardening(self) -> None:
-        """Add a swapfile backstop and cap Caddy's memory, idempotently.
+        """Apply host-level hardening: swap, Caddy memory cap, inotify limits.
 
-        Two independent protections against the OOM that silently kills Caddy
-        on the memory-tight, no-swap shard VMs (see project-shard-memory-hardening):
+        Three independent protections for the memory-tight shard VMs
+        (see project-shard-memory-hardening, project-shard-dovecot-inotify-limits):
           (a) a SWAP_SIZE_MB swapfile with a low vm.swappiness (safety net, not
               constant swapping), persisted in /etc/fstab so it survives reboot;
           (b) a systemd drop-in capping Caddy (MemoryHigh/MemoryMax) with
               Restart=on-failure, applied live via `systemctl set-property` so a
-              single OOM can never take the box down or leave Caddy dead for days.
+              single OOM can never take the box down or leave Caddy dead for days;
+          (c) raised fs.inotify limits, so Dovecot can actually watch all 100
+              mailboxes instead of silently giving up past the kernel's default
+              128 instances - the defect that left every pre-2026-08-17 shard
+              pinned at 128/128 with new-mail notification disabled.
 
-        Re-running is a no-op (swap skipped if present, drop-in rewritten
+        Re-running is a no-op (swap skipped if present, drop-ins rewritten
         identically). Safe to call on every deploy and as a retrofit.
         """
         script = (
@@ -292,6 +309,13 @@ class MailserverClient:
             f"else rm -f /swapfile; fi; fi; "
             f"sysctl -w vm.swappiness={SWAPPINESS} >/dev/null 2>&1; "
             f"grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness={SWAPPINESS}' >> /etc/sysctl.conf; "
+            # Inotify limits: persist in a drop-in (survives reboot) and apply live.
+            f"printf '# Managed by ColdEmailInfra - Dovecot needs one inotify instance\\n"
+            f"# per watched mailbox; the kernel default of 128 starves a 100-mailbox\\n"
+            f"# shard and silently disables new-mail notification.\\n"
+            f"fs.inotify.max_user_instances = {INOTIFY_MAX_USER_INSTANCES}\\n"
+            f"fs.inotify.max_user_watches = {INOTIFY_MAX_USER_WATCHES}\\n' > {SYSCTL_DROPIN_PATH}; "
+            f"sysctl -p {SYSCTL_DROPIN_PATH} >/dev/null 2>&1; "
             f"mkdir -p /etc/systemd/system/caddy.service.d; "
             f"printf '[Service]\\nMemoryHigh={CADDY_MEMORY_HIGH}\\nMemoryMax={CADDY_MEMORY_MAX}\\n"
             f"Restart=on-failure\\nRestartSec=10s\\n' > /etc/systemd/system/caddy.service.d/override.conf; "
@@ -300,6 +324,99 @@ class MailserverClient:
             f"systemctl reset-failed caddy 2>/dev/null || true"
         )
         self.sudo(f"bash -c {shlex.quote(script)}")
+
+    def apply_dovecot_limits(self) -> None:
+        """Install the Dovecot connection-limit overrides, persistently and live.
+
+        Why this needs its own method rather than just uploading the file: DMS
+        copies `<workdir>/docker-data/dms/config/dovecot.cf` to
+        `/etc/dovecot/local.conf` only inside `_setup_dovecot`, which runs at
+        container START. A plain `docker restart mailserver` does NOT re-run it,
+        so a retrofit that only writes the host file changes nothing until the
+        container is recreated. We therefore do both: write the host file (so it
+        survives recreation) and copy it into the live container (so it takes
+        effect now).
+
+        The config is validated with `doveconf -n` BEFORE dovecot is restarted,
+        and the previous local.conf is restored if it does not parse - a bad
+        config here would take mail down on the shard.
+
+        Idempotent: same file, same result. Safe on every deploy and as a retrofit.
+        """
+        wd = self._workdir()
+        body = (DMS_TEMPLATE_DIR / "dovecot.cf").read_text()
+
+        # 1. Persist on the host so container recreation keeps it.
+        self.upload_text(body, f"{wd}/docker-data/dms/config/dovecot.cf")
+
+        # 2. Copy into the live container, validating before we commit to it.
+        script = (
+            "set -e; "
+            "docker exec mailserver cp /etc/dovecot/local.conf /tmp/local.conf.bak; "
+            "docker cp /tmp/docker-mailserver-dovecot.cf mailserver:/etc/dovecot/local.conf; "
+            "if ! docker exec mailserver doveconf -n >/dev/null 2>/tmp/doveconf.err; then "
+            "  docker exec mailserver cp /tmp/local.conf.bak /etc/dovecot/local.conf; "
+            "  echo 'DOVECONF_INVALID'; cat /tmp/doveconf.err; exit 1; "
+            "fi; "
+            "docker exec mailserver supervisorctl restart dovecot >/dev/null; "
+            "echo DOVECOT_LIMITS_OK"
+        )
+        # Stage the file where the container-copy step can reach it.
+        self.upload_text(body, "/tmp/docker-mailserver-dovecot.cf")
+        rc, out, err = self.sudo(f"bash -c {shlex.quote(script)}", check=False)
+        if "DOVECOT_LIMITS_OK" not in out:
+            raise RuntimeError(
+                f"apply_dovecot_limits failed (config restored, dovecot untouched): "
+                f"rc={rc} out={out[-400:]} err={err[-400:]}"
+            )
+
+    def verify_dovecot_limits(self) -> dict:
+        """Return the effective Dovecot limits that matter, for assertion.
+
+        imap-login is the one that actually bit us: in its default
+        high-security mode (service_count=1) it forks one process per
+        connection and inherits default_process_limit, so ~400 concurrent
+        sessions ran into a 500 ceiling and Dovecot dropped connections.
+        service imap has a compiled-in default of 1024 and was never the
+        constraint - we raise it only for headroom.
+        """
+        rc, out, _ = self.sudo("docker exec mailserver doveconf -a", check=False)
+
+        def _svc(name: str, key: str) -> str | None:
+            in_block = False
+            for line in out.splitlines():
+                if line.startswith(f"service {name} " + "{"):
+                    in_block = True
+                    continue
+                if in_block:
+                    if line.startswith("}"):
+                        return None
+                    if line.strip().startswith(key):
+                        return line.split("=", 1)[1].strip()
+            return None
+
+        return {
+            "imap_login_service_count": _svc("imap-login", "service_count"),
+            "imap_login_process_limit": _svc("imap-login", "process_limit"),
+            "imap_login_client_limit": _svc("imap-login", "client_limit"),
+            "imap_process_limit": _svc("imap", "process_limit"),
+            "auth_client_limit": _svc("auth", "client_limit"),
+        }
+
+    def verify_inotify_limits(self) -> dict:
+        """Return effective inotify limits plus current instance usage."""
+        rc, out, _ = self.sudo(
+            "bash -c 'echo inst=$(sysctl -n fs.inotify.max_user_instances); "
+            "echo watch=$(sysctl -n fs.inotify.max_user_watches); "
+            "echo inuse=$(find /proc/*/fd -lname \"anon_inode:inotify\" 2>/dev/null | wc -l)'",
+            check=False,
+        )
+        vals = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                vals[k] = v.strip()
+        return vals
 
     def install_warmup_sieve(self, restart: bool = True) -> None:
         """Install the global Sieve filter that routes Instantly warmup peer
@@ -439,8 +556,29 @@ class MailserverClient:
         # for docker commands in this session.
         self.sudo(f"usermod -aG docker {self.user}", check=False)
 
-    def acquire_letsencrypt_cert(self, hostname: str, email: str, cf_api_token: str) -> None:
-        """Acquire a Let's Encrypt cert for `hostname` via Cloudflare DNS-01.
+    def acquire_letsencrypt_cert(
+        self,
+        hostname: str,
+        email: str,
+        cf_api_token: str,
+        extra_names: list[str] | None = None,
+    ) -> None:
+        """Acquire a Let's Encrypt cert for `hostname` (+ `extra_names`) via DNS-01.
+
+        `extra_names` exists because each sending subdomain has its own MX
+        target: `team.<root> MX -> mail.team.<root>`. A cert covering only
+        `mail.<root>` therefore does not match the hostname a sender actually
+        connects to. That is invisible under opportunistic TLS (senders do not
+        check the name) and under MTA-STS `mode: testing`, but it makes
+        `mode: enforce` unusable - an MTA-STS-honouring sender validates the
+        cert against the MX hostname, gets a mismatch, and refuses delivery.
+        See reference-mta-sts-enforce-blocked-by-cert.
+
+        `--cert-name {hostname}` pins the lineage so the cert stays at
+        /etc/letsencrypt/live/{hostname}/ where docker-mailserver expects it -
+        without it, adding names would create a `-0001` lineage and DMS would
+        silently keep serving the old cert. `--expand` reissues when the name
+        list grows.
 
         Avoids the port-80 HTTP-01 challenge entirely — useful when the
         hostname's A record doesn't resolve to this VPS (e.g. zone still
@@ -465,13 +603,16 @@ class MailserverClient:
         # propagation-seconds=600 so the new TXT record stays live past LE
         # resolvers' negative-cache window (~5 min per CF's SOA minimum).
         # Shorter values race the cached NXDOMAIN from an earlier attempt.
+        names = [hostname] + [n for n in (extra_names or []) if n != hostname]
+        d_flags = " ".join(f"-d {shlex.quote(n)}" for n in names)
         try:
             self.sudo(
                 f"certbot certonly --dns-cloudflare "
                 f"--dns-cloudflare-credentials {creds_path} "
                 f"--dns-cloudflare-propagation-seconds 600 "
                 f"--non-interactive --agree-tos --email {email} "
-                f"-d {hostname} --keep-until-expiring"
+                f"--cert-name {shlex.quote(hostname)} {d_flags} "
+                f"--expand --keep-until-expiring"
             )
         except RuntimeError as exc:
             _, log, _ = self.sudo("tail -80 /var/log/letsencrypt/letsencrypt.log", check=False)
@@ -535,7 +676,16 @@ class MailserverClient:
         le_email: str,
         cf_api_token: str,
         ssl_type: str = "self-signed",
+        subdomains: list[str] | None = None,
     ) -> None:
+        """Install docker-mailserver.
+
+        `subdomains` is the plain sending-sub label list from ShardState. It is
+        used to put every sending subdomain's MX host on the TLS cert, because
+        each sub has its own MX target (`team.<root> MX -> mail.team.<root>`) and
+        a cert covering only `mail.<root>` would not match the hostname senders
+        connect to. Omit it and you get the old single-name cert.
+        """
         if ssl_type not in ("self-signed", "letsencrypt"):
             raise ValueError(f"ssl_type must be 'self-signed' or 'letsencrypt', got {ssl_type!r}")
 
@@ -574,7 +724,14 @@ class MailserverClient:
         # Acquire certs before starting the container so docker-mailserver's
         # startup checks find them on disk.
         if ssl_type == "letsencrypt":
-            self.acquire_letsencrypt_cert(f"mail.{root_domain}", le_email, cf_api_token)
+            # Cover every sending subdomain's MX host, not just the apex - see
+            # acquire_letsencrypt_cert for why.
+            self.acquire_letsencrypt_cert(
+                f"mail.{root_domain}",
+                le_email,
+                cf_api_token,
+                extra_names=[f"mail.{sub}.{root_domain}" for sub in sorted(subdomains or [])],
+            )
         else:
             self.acquire_self_signed_cert(f"mail.{root_domain}")
 

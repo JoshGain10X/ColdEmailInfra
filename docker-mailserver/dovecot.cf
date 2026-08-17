@@ -9,23 +9,27 @@ default_process_limit = 500
 # connections per mailbox from the same server IP.
 mail_max_userip_connections = 50
 
-# service imap needs one process per authenticated session. Bison holds ~4 IMAP
-# connections per sender mailbox and Instantly warmup another ~4, so a
-# 100-mailbox shard runs ~800 concurrent sessions - not the ~100 assumed when
-# this file was first written.
+# service imap needs one process per authenticated session. A 100-mailbox shard
+# runs ~400 concurrent IMAP sessions (Bison polling plus Instantly warmup), not
+# the ~100 assumed when this file was first written. Dovecot's compiled-in
+# default for this service is already 1024, so this was never the binding limit
+# - raised only for headroom as mailbox counts grow.
 service imap {
   process_limit = 1200
 }
 
-# imap-login runs in high-security mode by default (service_count = 1), forking
-# one login process per connection. At ~800 concurrent connections that
-# exhausted process_limit and Dovecot silently dropped client connections:
+# THIS is the limit that actually bit us. imap-login runs in high-security mode
+# by default (service_count = 1), forking one login process per connection and
+# inheriting default_process_limit. A 100-mailbox shard holds ~400 concurrent
+# sessions, so it sat at 400/500 - 80% of the ceiling - and burst over it
+# 25-40 times per shard per week:
 #   "service(imap-login): process_limit (500) reached, connections are dropped"
-# Bison's IMAP sessions were dropped mid-flight, never reconnected, and inbound
-# reply-ingestion stalled fleet-wide while senders still reported "Connected"
-# (incident 2026-08-14, all 20 shards). High-performance mode lets a handful of
-# login processes carry every connection, removing the ceiling and freeing
-# ~400 processes per shard.
+# High-performance mode lets a handful of login processes carry every
+# connection, which removes the ceiling rather than just raising it.
+# Measured on evolve10xleaders.com: 402 -> 15 login processes, ~275MB RAM and
+# ~320MB swap returned. (Note: this was NOT the cause of the 2026-08-15/17
+# "ingestion stall" alerts - those were a monitor sampling bug. This is a real
+# but separate latent defect.)
 service imap-login {
   service_count = 0
   client_limit = 1000
