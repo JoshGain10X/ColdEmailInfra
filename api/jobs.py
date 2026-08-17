@@ -501,10 +501,16 @@ def run_deploy(
                 )
                 if not out.strip().endswith(" healthy"):
                     ms.install_docker()
-                    ms.install_dms(domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type)
+                    ms.install_dms(
+                        domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type,
+                        subdomains=state.get("subdomains"),
+                    )
             else:
                 ms.install_docker()
-                ms.install_dms(domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type)
+                ms.install_dms(
+                    domain, le_email, ctx.cloudflare.token, ssl_type=ssl_type,
+                    subdomains=state.get("subdomains"),
+                )
         finally:
             ms.close()
         state.mark_step_done("install_mailserver")
